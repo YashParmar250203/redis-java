@@ -2,9 +2,14 @@ package com.example.redis.command;
 
 import com.example.redis.command.impl.DelCommand;
 import com.example.redis.command.impl.ExistsCommand;
+import com.example.redis.command.impl.ExpireCommand;
 import com.example.redis.command.impl.GetCommand;
 import com.example.redis.command.impl.SetCommand;
+import com.example.redis.command.impl.TtlCommand;
 import com.example.redis.exception.InvalidCommandException;
+import com.example.redis.exception.InvalidExpireTimeException;
+import com.example.redis.exception.NotAnIntegerException;
+import com.example.redis.exception.SyntaxErrorException;
 import com.example.redis.exception.UnknownCommandException;
 import com.example.redis.exception.WrongNumberOfArgumentsException;
 import com.example.redis.storage.InMemoryStore;
@@ -17,6 +22,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CommandExecutorTest {
 
@@ -29,7 +35,9 @@ class CommandExecutorTest {
                 new SetCommand(store),
                 new GetCommand(store),
                 new DelCommand(store),
-                new ExistsCommand(store)
+                new ExistsCommand(store),
+                new ExpireCommand(store),
+                new TtlCommand(store)
         ));
     }
 
