@@ -170,3 +170,49 @@ mvn test
 
 **What should be improved before Phase 4:** the RESP tokenizer will need real argument-boundary parsing (values containing spaces aren't supported by today's whitespace-split parser) — this becomes unavoidable once binary-safe values are on the table.
 
+---
+
+## Phase 4 — Custom TCP Server and RESP Protocol
+
+**What was implemented:** A single-threaded, NIO Selector-based TCP server on port 6380 (configurable via `redis.tcp.port`) speaking real RESP (multibulk arrays) and Redis's inline-command shorthand, both handled by the same incremental parser. `redis-cli -p 6380` works against it directly.
+
+**Architecture changes:** New `server` package (`TcpServer`, `ClientConnection`) and `protocol` package (`RequestParser`, `RespReplyEncoder`). `CommandExecutor` gained `execute(String[] tokens)` — the REST path's `execute(String)` now just tokenizes and delegates to it. No `Command` implementation changed at all; the abstraction built in Phase 1 specifically for this moment did its job.
+
+```
+Client (redis-cli or telnet)
+        |  TCP
+        v
+TcpServer (NIO Selector event loop)
+        |
+ClientConnection (buffers bytes, calls RequestParser)
+        |
+RequestParser (RESP array or inline line -> String[] tokens)
+        |
+CommandExecutor.execute(String[])   <-- same dispatcher REST uses
+        |
+Command.execute(args) -> Store
+        |
+RespReplyEncoder (result -> RESP wire reply)
+        |
+        v
+back to client
+```
+
+**Design decisions:**
+- **Single-threaded event loop, deliberately** — mirrors real Redis's own concurrency model. No locking needed around command execution on this path since only one command runs at a time across all clients; the honest cost is that one slow command blocks everyone else, same trade-off Redis itself makes.
+- **Dual protocol support is one implementation, not two** — real Redis servers accept both RESP arrays and plain inline lines; detecting by first byte (`*` vs anything else) is exactly what real Redis does, not a shortcut invented here.
+- **Never consume buffered bytes until a complete command is confirmed present.** This is the core correctness property for any incremental network parser — a command can arrive split across multiple reads, and partially consuming the buffer would corrupt framing for everything after it.
+- **`SimpleStringReply` marker type** was introduced so `SET`'s `"OK"` reply is distinguishable from a `GET` result that happens to literally be the string `"OK"` — only the former should be RESP-encoded as a status line (`+OK\r\n`) rather than a bulk string.
+- **Pipelining works without extra code** — parsing loops while the buffer still has a complete command, so multiple commands sent in one packet all get executed and replied to.
+
+**Known, stated simplifications (not oversights):**
+- Connection data is treated as UTF-8 text, not raw binary — real Redis bulk strings are fully binary-safe (arbitrary bytes, including nulls); ours assumes single-byte-per-character content.
+- Writes use a simple blocking-retry loop rather than registering for `OP_WRITE` and resuming on write-readiness. Fine for this project's small, single-reply payloads; a server handling large replies or slow clients would need real write backpressure handling to avoid busy-spinning.
+
+**Tests:** `RequestParserTest` covers RESP parsing across multiple simulated TCP chunks (the actual hard part of this phase), pipelined inline commands, and malformed-input protocol errors — all without touching a real socket. `RespReplyEncoderTest` covers every reply type including the `"OK"`-as-bulk-string-vs-status-line distinction. `TcpServerIntegrationTest` opens genuine sockets against the real running server (bound to an OS-assigned ephemeral port via `redis.tcp.port=0`) and verifies inline commands, RESP round-trips, pipelining, error replies, and RESP values containing spaces.
+
+**What I learned:** why an incremental parser must never partially consume its buffer; how to reason about partial TCP reads and reassembly; why Redis's single-threaded design is a legitimate engineering trade-off rather than a limitation to work around; how to keep a dispatch layer transport-agnostic in practice, not just in theory.
+
+**What should be improved before Phase 5:** persistence (AOF) will need to hook into the same `CommandExecutor.execute` path to log every mutating command — worth checking whether that's best done as a decorator around `CommandExecutor` or inside each `Command`, before writing any persistence code.
+
+

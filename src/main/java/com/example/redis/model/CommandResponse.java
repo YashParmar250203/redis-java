@@ -21,7 +21,8 @@ public class CommandResponse {
     }
 
     public static CommandResponse success(Object result) {
-        return new CommandResponse(true, result, null);
+        Object jsonSafeResult = (result instanceof SimpleStringReply reply) ? reply.value() : result;
+        return new CommandResponse(true, jsonSafeResult, null);
     }
 
     public static CommandResponse error(String message) {

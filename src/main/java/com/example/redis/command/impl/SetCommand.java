@@ -4,6 +4,7 @@ import com.example.redis.command.Command;
 import com.example.redis.command.util.Arguments;
 import com.example.redis.exception.SyntaxErrorException;
 import com.example.redis.exception.WrongNumberOfArgumentsException;
+import com.example.redis.model.SimpleStringReply;
 import com.example.redis.storage.Store;
 import org.springframework.stereotype.Component;
 
@@ -34,13 +35,13 @@ public class SetCommand implements Command {
     public Object execute(String[] args) {
         if (args.length == 2) {
             store.set(args[0], args[1]);
-            return "OK";
+            return new SimpleStringReply("OK");
         }
 
         if (args.length == 4 && EX_OPTION.equalsIgnoreCase(args[2])) {
             long ttlSeconds = Arguments.parsePositiveSeconds(args[3], name());
             store.set(args[0], args[1], ttlSeconds);
-            return "OK";
+            return new SimpleStringReply("OK");
         }
 
         if (args.length < 2) {

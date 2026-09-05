@@ -10,17 +10,16 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Parses a raw command line and dispatches it to the matching {@link Command}.
+ * Parses a command and dispatches it to the matching {@link Command}.
  * <p>
- * This is the single chokepoint between "text in" and "command executed" -
- * both the REST controller (Phase 1) and the future TCP/RESP server
- * (Phase 4) will call {@link #execute(String)}, so dispatch logic and
- * command registration only need to exist once.
- * <p>
- * Tokenization is currently naive (split on whitespace). It does not yet
- * support quoted values containing spaces - that is a known limitation to
- * be resolved when RESP parsing (which encodes argument boundaries
- * explicitly rather than relying on whitespace) is introduced in Phase 4.
+ * This is the single chokepoint between "input in" and "command executed" -
+ * both the REST controller (Phase 1) and the TCP/RESP server (Phase 4) call
+ * into this class, so dispatch logic and command registration only exist
+ * once. The REST path uses {@link #execute(String)} (whitespace-tokenized,
+ * for convenience/backwards compatibility); the RESP path uses
+ * {@link #execute(String[])} directly with tokens whose boundaries were
+ * already determined by the wire protocol - which is what lets RESP-encoded
+ * values contain spaces, unlike the whitespace-split path.
  */
 @Component
 public class CommandExecutor {
@@ -32,14 +31,27 @@ public class CommandExecutor {
                 .collect(Collectors.toMap(c -> c.name().toUpperCase(), c -> c));
     }
 
+    /**
+     * Parses a raw whitespace-separated command line and dispatches it.
+     * Values containing spaces are not supported here - see {@link #execute(String[])}.
+     */
     public Object execute(String rawLine) {
         if (rawLine == null || rawLine.isBlank()) {
             throw new InvalidCommandException("empty command");
         }
+        return execute(tokenize(rawLine));
+    }
 
-        String[] tokens = tokenize(rawLine);
+    /**
+     * Dispatches an already-tokenized command. Used by the RESP path, where
+     * the protocol itself delimits argument boundaries explicitly.
+     */
+    public Object execute(String[] tokens) {
+        if (tokens.length == 0) {
+            throw new InvalidCommandException("empty command");
+        }
+
         String commandName = tokens[0].toUpperCase();
-
         Command command = commandsByName.get(commandName);
         if (command == null) {
             throw new UnknownCommandException(tokens[0]);
