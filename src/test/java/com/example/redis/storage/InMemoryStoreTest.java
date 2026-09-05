@@ -3,6 +3,8 @@ package com.example.redis.storage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -12,6 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class InMemoryStoreTest {
@@ -236,5 +239,149 @@ class InMemoryStoreTest {
 
         assertEquals(threadCount, successfulWrites.get());
         assertTrue(store.exists("counter"));
+    }
+
+    // ---- LIST ----
+
+    @Test
+    void rpushAppendsInOrderAndReturnsLength() {
+        assertEquals(3, store.rpush("mylist", "a", "b", "c"));
+        assertEquals(java.util.List.of("a", "b", "c"), store.lrange("mylist", 0, -1));
+    }
+
+    @Test
+    void lpushPrependsReversingMultiValueOrder() {
+        // Matches real Redis: LPUSH k a b c leaves the list as [c, b, a].
+        store.lpush("mylist", "a", "b", "c");
+        assertEquals(java.util.List.of("c", "b", "a"), store.lrange("mylist", 0, -1));
+    }
+
+    @Test
+    void lpopAndRpopRemoveFromRespectiveEnds() {
+        store.rpush("mylist", "a", "b", "c");
+        assertEquals("a", store.lpop("mylist"));
+        assertEquals("c", store.rpop("mylist"));
+        assertEquals(java.util.List.of("b"), store.lrange("mylist", 0, -1));
+    }
+
+    @Test
+    void poppingLastElementDeletesTheKey() {
+        store.rpush("mylist", "only");
+        store.lpop("mylist");
+        assertFalse(store.exists("mylist"));
+    }
+
+    @Test
+    void lpopOnMissingListReturnsNull() {
+        assertNull(store.lpop("missing"));
+    }
+
+    @Test
+    void lrangeSupportsNegativeIndices() {
+        store.rpush("mylist", "a", "b", "c", "d");
+        assertEquals(java.util.List.of("c", "d"), store.lrange("mylist", -2, -1));
+    }
+
+    @Test
+    void listCommandOnStringKeyThrowsWrongType() {
+        store.set("name", "Yash");
+        assertThrows(com.example.redis.exception.WrongTypeException.class,
+                () -> store.rpush("name", "value"));
+    }
+
+    // ---- SET ----
+
+    @Test
+    void saddReturnsCountOfNewlyAddedMembers() {
+        assertEquals(2, store.sadd("tags", "a", "b"));
+        assertEquals(1, store.sadd("tags", "b", "c")); // "b" already present
+    }
+
+    @Test
+    void sismemberReflectsMembership() {
+        store.sadd("tags", "a");
+        assertTrue(store.sismember("tags", "a"));
+        assertFalse(store.sismember("tags", "z"));
+        assertFalse(store.sismember("missing", "a"));
+    }
+
+    @Test
+    void sremRemovesMembersAndDeletesEmptySet() {
+        store.sadd("tags", "a");
+        assertEquals(1, store.srem("tags", "a"));
+        assertFalse(store.exists("tags"));
+    }
+
+    @Test
+    void smembersReturnsSnapshotCopy() {
+        store.sadd("tags", "a", "b");
+        assertEquals(Set.of("a", "b"), store.smembers("tags"));
+    }
+
+    // ---- HASH ----
+
+    @Test
+    void hsetReturnsWhetherFieldWasNew() {
+        assertTrue(store.hset("user:1", "name", "Yash"));
+        assertFalse(store.hset("user:1", "name", "Sharma")); // overwrite, not new
+    }
+
+    @Test
+    void hgetReturnsFieldValue() {
+        store.hset("user:1", "name", "Yash");
+        assertEquals("Yash", store.hget("user:1", "name"));
+        assertNull(store.hget("user:1", "missing-field"));
+    }
+
+    @Test
+    void hdelRemovesFieldAndDeletesEmptyHash() {
+        store.hset("user:1", "name", "Yash");
+        assertTrue(store.hdel("user:1", "name"));
+        assertFalse(store.exists("user:1"));
+    }
+
+    @Test
+    void hgetallReturnsAllFields() {
+        store.hset("user:1", "name", "Yash");
+        store.hset("user:1", "city", "Delhi");
+        assertEquals(Map.of("name", "Yash", "city", "Delhi"), store.hgetall("user:1"));
+    }
+
+    // ---- SORTED SET (ZSET) ----
+
+    @Test
+    void zaddReturnsTrueForNewMemberFalseForScoreUpdate() {
+        assertTrue(store.zadd("leaderboard", 10, "alice"));
+        assertFalse(store.zadd("leaderboard", 20, "alice"));
+    }
+
+    @Test
+    void zrangeReturnsMembersInAscendingScoreOrder() {
+        store.zadd("leaderboard", 30, "charlie");
+        store.zadd("leaderboard", 10, "alice");
+        store.zadd("leaderboard", 20, "bob");
+        assertEquals(java.util.List.of("alice", "bob", "charlie"), store.zrange("leaderboard", 0, -1));
+    }
+
+    @Test
+    void zaddMovesMemberWhenScoreUpdated() {
+        store.zadd("leaderboard", 10, "alice");
+        store.zadd("leaderboard", 5, "bob");
+        store.zadd("leaderboard", 100, "alice"); // alice should now rank last
+        assertEquals(java.util.List.of("bob", "alice"), store.zrange("leaderboard", 0, -1));
+    }
+
+    @Test
+    void zremRemovesMemberAndDeletesEmptyZset() {
+        store.zadd("leaderboard", 10, "alice");
+        assertTrue(store.zrem("leaderboard", "alice"));
+        assertFalse(store.exists("leaderboard"));
+    }
+
+    @Test
+    void zsetCommandOnListKeyThrowsWrongType() {
+        store.rpush("mylist", "a");
+        assertThrows(com.example.redis.exception.WrongTypeException.class,
+                () -> store.zadd("mylist", 1, "member"));
     }
 }

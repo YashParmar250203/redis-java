@@ -2,27 +2,22 @@ package com.example.redis.command.impl;
 
 import com.example.redis.command.Command;
 import com.example.redis.exception.WrongNumberOfArgumentsException;
-import com.example.redis.storage.Store;
+import com.example.redis.storage.ListOperations;
 import org.springframework.stereotype.Component;
 
-/**
- * GET key
- * <p>
- * Returns null (rendered as JSON null / Redis "nil") if the key does not exist.
- * Time complexity: O(1) average.
- */
+/** LPOP key - O(1). Returns null if the list is empty or missing. */
 @Component
-public class GetCommand implements Command {
+public class LPopCommand implements Command {
 
-    private final Store store;
+    private final ListOperations listOperations;
 
-    public GetCommand(Store store) {
-        this.store = store;
+    public LPopCommand(ListOperations listOperations) {
+        this.listOperations = listOperations;
     }
 
     @Override
     public String name() {
-        return "GET";
+        return "LPOP";
     }
 
     @Override
@@ -30,6 +25,6 @@ public class GetCommand implements Command {
         if (args.length != 1) {
             throw new WrongNumberOfArgumentsException(name());
         }
-        return store.get(args[0]);
+        return listOperations.lpop(args[0]);
     }
 }

@@ -2,27 +2,22 @@ package com.example.redis.command.impl;
 
 import com.example.redis.command.Command;
 import com.example.redis.exception.WrongNumberOfArgumentsException;
-import com.example.redis.storage.Store;
+import com.example.redis.storage.HashOperations;
 import org.springframework.stereotype.Component;
 
-/**
- * GET key
- * <p>
- * Returns null (rendered as JSON null / Redis "nil") if the key does not exist.
- * Time complexity: O(1) average.
- */
+/** HGETALL key - O(n) in field count. Returns an empty map if missing. */
 @Component
-public class GetCommand implements Command {
+public class HGetAllCommand implements Command {
 
-    private final Store store;
+    private final HashOperations hashOperations;
 
-    public GetCommand(Store store) {
-        this.store = store;
+    public HGetAllCommand(HashOperations hashOperations) {
+        this.hashOperations = hashOperations;
     }
 
     @Override
     public String name() {
-        return "GET";
+        return "HGETALL";
     }
 
     @Override
@@ -30,6 +25,6 @@ public class GetCommand implements Command {
         if (args.length != 1) {
             throw new WrongNumberOfArgumentsException(name());
         }
-        return store.get(args[0]);
+        return hashOperations.hgetall(args[0]);
     }
 }

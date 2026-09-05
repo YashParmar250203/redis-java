@@ -66,4 +66,4 @@ public interface Store {
      * @return the number of keys actually removed by this sweep.
      */
     int runActiveExpirationCycle();
-}   
+}
