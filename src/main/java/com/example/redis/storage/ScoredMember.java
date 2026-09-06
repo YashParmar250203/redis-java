@@ -1,10 +1,12 @@
 package com.example.redis.storage;
 
+import java.io.Serializable;
+
 /**
  * A single (score, member) pair, ordered first by score then lexicographically
  * by member name - the same tie-break rule real Redis uses for ZSET ordering.
  */
-record ScoredMember(double score, String member) implements Comparable<ScoredMember> {
+record ScoredMember(double score, String member) implements Comparable<ScoredMember>, Serializable {
 
     @Override
     public int compareTo(ScoredMember other) {

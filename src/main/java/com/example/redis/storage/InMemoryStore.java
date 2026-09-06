@@ -3,8 +3,14 @@ package com.example.redis.storage;
 import com.example.redis.exception.WrongTypeException;
 import org.springframework.stereotype.Component;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,7 +46,7 @@ import java.util.function.Supplier;
  * </ul>
  */
 @Component
-public class InMemoryStore implements Store, ListOperations, SetOperations, HashOperations, SortedSetOperations {
+public class InMemoryStore implements Store, ListOperations, SetOperations, HashOperations, SortedSetOperations, Snapshottable {
 
     private static final int ACTIVE_EXPIRATION_SAMPLE_SIZE = 20;
     private static final int ACTIVE_EXPIRATION_MAX_ROUNDS = 5;
@@ -344,6 +350,56 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
             return List.of();
         }
         return new ArrayList<>(membersInOrder.subList(range[0], range[1] + 1));
+    }
+
+    // ================= SNAPSHOT (RDB-style) =================
+
+    /**
+     * Serializes a copy of the current keyspace via Java serialization.
+     * <p>
+     * Copying into a plain {@link HashMap} first (rather than serializing
+     * the live ConcurrentHashMap directly) gives a faster, "mostly
+     * consistent" point-in-time view - not a strictly atomic one. Real
+     * Redis's RDB save forks the process to get a true copy-on-write
+     * snapshot without blocking writers at all; reproducing that here would
+     * mean shelling out to the OS fork() call, which the JVM doesn't expose
+     * directly. Documented trade-off, not an oversight.
+     * <p>
+     * Java serialization itself is also a stated simplification: it's not
+     * cross-language portable and can break across incompatible code
+     * changes, unlike Redis's own compact, versioned, custom binary RDB
+     * format. A production system would want a stable schema (e.g.
+     * Protocol Buffers or a hand-rolled versioned binary format) instead.
+     */
+    @Override
+    public byte[] createSnapshot() throws IOException {
+        Map<String, StoredValue> copy = new HashMap<>(data);
+        try (ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+             ObjectOutputStream objectStream = new ObjectOutputStream(byteStream)) {
+            objectStream.writeObject(copy);
+            return byteStream.toByteArray();
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void restoreSnapshot(byte[] snapshotData) throws IOException {
+        Map<String, StoredValue> restored;
+        try (ByteArrayInputStream byteStream = new ByteArrayInputStream(snapshotData);
+             ObjectInputStream objectStream = new ObjectInputStream(byteStream)) {
+            restored = (Map<String, StoredValue>) objectStream.readObject();
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Corrupt snapshot: unrecognized class in stream", e);
+        }
+
+        data.clear();
+        keysWithExpiry.clear();
+        data.putAll(restored);
+        for (Map.Entry<String, StoredValue> entry : restored.entrySet()) {
+            if (entry.getValue().expireAtMillis() != null) {
+                keysWithExpiry.add(entry.getKey());
+            }
+        }
     }
 
     // ================= shared internals =================

@@ -31,4 +31,9 @@ public class SAddCommand implements Command {
         String[] values = Arrays.copyOfRange(args, 1, args.length);
         return setOperations.sadd(key, values);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

@@ -29,4 +29,9 @@ public class ZAddCommand implements Command {
         double score = Arguments.parseDouble(args[1]);
         return sortedSetOperations.zadd(args[0], score, args[2]) ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

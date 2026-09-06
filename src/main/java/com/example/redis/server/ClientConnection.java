@@ -1,6 +1,6 @@
 package com.example.redis.server;
 
-import com.example.redis.command.CommandExecutor;
+import com.example.redis.command.CommandDispatcher;
 import com.example.redis.exception.RedisException;
 import com.example.redis.protocol.RequestParser;
 import com.example.redis.protocol.RespReplyEncoder;
@@ -42,13 +42,13 @@ class ClientConnection {
     private static final int READ_BUFFER_SIZE = 8192;
 
     private final SocketChannel channel;
-    private final CommandExecutor commandExecutor;
+    private final CommandDispatcher commandDispatcher;
     private final StringBuilder pending = new StringBuilder();
     private final ByteBuffer readBuffer = ByteBuffer.allocate(READ_BUFFER_SIZE);
 
-    ClientConnection(SocketChannel channel, CommandExecutor commandExecutor) {
+    ClientConnection(SocketChannel channel, CommandDispatcher commandDispatcher) {
         this.channel = channel;
-        this.commandExecutor = commandExecutor;
+        this.commandDispatcher = commandDispatcher;
     }
 
     void handleReadable(SelectionKey key) throws IOException {
@@ -92,7 +92,7 @@ class ClientConnection {
 
     private String executeAndEncode(String[] tokens) {
         try {
-            Object result = commandExecutor.execute(tokens);
+            Object result = commandDispatcher.execute(tokens);
             return RespReplyEncoder.encode(result);
         } catch (RedisException e) {
             return RespReplyEncoder.encodeError(e.getMessage());

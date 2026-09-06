@@ -27,4 +27,9 @@ public class HGetCommand implements Command {
         }
         return hashOperations.hget(args[0], args[1]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

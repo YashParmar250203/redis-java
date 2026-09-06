@@ -27,4 +27,9 @@ public class HSetCommand implements Command {
         }
         return hashOperations.hset(args[0], args[1], args[2]) ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

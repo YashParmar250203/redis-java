@@ -1,5 +1,7 @@
 package com.example.redis.storage;
 
+import java.io.Serializable;
+
 /**
  * Internal representation of a stored entry.
  *
@@ -11,5 +13,5 @@ package com.example.redis.storage;
  *                        or {@code null} if the key has no TTL.
  * @param type           which Redis data type this entry currently holds.
  */
-record StoredValue(Object value, Long expireAtMillis, RedisType type) {
+record StoredValue(Object value, Long expireAtMillis, RedisType type) implements Serializable {
 }

@@ -1,10 +1,11 @@
 package com.example.redis.server;
 
-import com.example.redis.command.CommandExecutor;
+import com.example.redis.command.CommandDispatcher;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -19,8 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A single-threaded, non-blocking (NIO Selector-based) TCP server exposing
- * the same {@link CommandExecutor} used by the REST layer, over raw sockets
- * speaking RESP (and Redis's inline-command shorthand).
+ * the same {@link CommandDispatcher} used by the REST layer, over raw
+ * sockets speaking RESP (and Redis's inline-command shorthand).
  * <p>
  * <b>Why single-threaded, deliberately:</b> this mirrors real Redis's own
  * concurrency model. One event-loop thread handles accepting connections,
@@ -36,12 +37,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Started via {@link ApplicationRunner} so it comes up alongside the rest of
  * the Spring context without blocking application startup: binding happens
  * synchronously in {@link #run}, but the accept/read/write loop itself runs
- * on its own background thread.
+ * on its own background thread. Ordered to run after persistence recovery
+ * (see {@code persistence.PersistenceRecoveryRunner}'s @Order(1)) so no
+ * client can connect before recovered data is in place.
  */
 @Component
+@Order(2)
 public class TcpServer implements ApplicationRunner {
 
-    private final CommandExecutor commandExecutor;
+    private final CommandDispatcher commandDispatcher;
     private final int configuredPort;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
@@ -49,8 +53,8 @@ public class TcpServer implements ApplicationRunner {
     private ServerSocketChannel serverChannel;
     private volatile int boundPort;
 
-    public TcpServer(CommandExecutor commandExecutor, @Value("${redis.tcp.port:6380}") int configuredPort) {
-        this.commandExecutor = commandExecutor;
+    public TcpServer(CommandDispatcher commandDispatcher, @Value("${redis.tcp.port:6380}") int configuredPort) {
+        this.commandDispatcher = commandDispatcher;
         this.configuredPort = configuredPort;
     }
 
@@ -117,7 +121,7 @@ public class TcpServer implements ApplicationRunner {
         }
         clientChannel.configureBlocking(false);
         SelectionKey clientKey = clientChannel.register(selector, SelectionKey.OP_READ);
-        clientKey.attach(new ClientConnection(clientChannel, commandExecutor));
+        clientKey.attach(new ClientConnection(clientChannel, commandDispatcher));
     }
 
     private void closeQuietly(SelectionKey key) {

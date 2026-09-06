@@ -27,4 +27,9 @@ public class SMembersCommand implements Command {
         }
         return setOperations.smembers(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

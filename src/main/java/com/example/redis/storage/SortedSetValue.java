@@ -1,5 +1,6 @@
 package com.example.redis.storage;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -24,7 +25,9 @@ import java.util.concurrent.ConcurrentSkipListSet;
  * level, which is what real Redis's skip list actually carries) would give.
  * Building that structure is a natural, interview-worthy next step.
  */
-class SortedSetValue {
+class SortedSetValue implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     private final Map<String, Double> scoresByMember = new ConcurrentHashMap<>();
     private final ConcurrentSkipListSet<ScoredMember> orderedByScore = new ConcurrentSkipListSet<>();

@@ -31,4 +31,9 @@ public class RPushCommand implements Command {
         String[] values = Arrays.copyOfRange(args, 1, args.length);
         return listOperations.rpush(key, values);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

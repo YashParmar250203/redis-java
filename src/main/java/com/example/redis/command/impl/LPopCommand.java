@@ -27,4 +27,9 @@ public class LPopCommand implements Command {
         }
         return listOperations.lpop(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

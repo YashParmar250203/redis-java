@@ -31,4 +31,9 @@ public class SRemCommand implements Command {
         String[] values = Arrays.copyOfRange(args, 1, args.length);
         return setOperations.srem(key, values);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

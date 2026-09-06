@@ -27,4 +27,9 @@ public class HDelCommand implements Command {
         }
         return hashOperations.hdel(args[0], args[1]) ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

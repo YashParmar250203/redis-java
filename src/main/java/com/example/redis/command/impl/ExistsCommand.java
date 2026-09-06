@@ -38,4 +38,9 @@ public class ExistsCommand implements Command {
         }
         return existingCount;
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

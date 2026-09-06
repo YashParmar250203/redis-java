@@ -31,4 +31,9 @@ public class LPushCommand implements Command {
         String[] values = Arrays.copyOfRange(args, 1, args.length);
         return listOperations.lpush(key, values);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

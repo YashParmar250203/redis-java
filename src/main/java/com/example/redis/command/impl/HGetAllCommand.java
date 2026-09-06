@@ -27,4 +27,9 @@ public class HGetAllCommand implements Command {
         }
         return hashOperations.hgetall(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

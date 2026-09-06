@@ -32,4 +32,9 @@ public class TtlCommand implements Command {
         }
         return store.ttl(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

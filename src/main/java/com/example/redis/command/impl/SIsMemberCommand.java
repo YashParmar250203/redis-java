@@ -27,4 +27,9 @@ public class SIsMemberCommand implements Command {
         }
         return setOperations.sismember(args[0], args[1]) ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

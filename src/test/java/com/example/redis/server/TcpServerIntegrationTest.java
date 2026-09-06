@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * the network layer. Uses {@code redis.tcp.port=0} so the OS assigns a free
  * ephemeral port, retrieved afterwards via {@link TcpServer#getBoundPort()}.
  */
-@SpringBootTest(properties = "redis.tcp.port=0")
+@SpringBootTest(properties = {"redis.tcp.port=0", "redis.persistence.mode=none"})
 class TcpServerIntegrationTest {
 
     @Autowired

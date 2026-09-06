@@ -29,8 +29,10 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CommandExecutorTest {
 
@@ -150,5 +152,23 @@ class CommandExecutorTest {
     void zaddWithNonNumericScoreThrows() {
         assertThrows(com.example.redis.exception.NotAFloatException.class,
                 () -> executor.execute("ZADD leaderboard notanumber alice"));
+    }
+
+    @Test
+    void isWriteCommandClassifiesCommandsCorrectly() {
+        assertTrue(executor.isWriteCommand("SET"));
+        assertTrue(executor.isWriteCommand("set")); // case-insensitive, matches dispatch itself
+        assertTrue(executor.isWriteCommand("LPUSH"));
+        assertTrue(executor.isWriteCommand("EXPIRE"));
+
+        assertFalse(executor.isWriteCommand("GET"));
+        assertFalse(executor.isWriteCommand("EXISTS"));
+        assertFalse(executor.isWriteCommand("TTL"));
+        assertFalse(executor.isWriteCommand("LRANGE"));
+    }
+
+    @Test
+    void isWriteCommandReturnsFalseForUnknownCommand() {
+        assertFalse(executor.isWriteCommand("NOTACOMMAND"));
     }
 }

@@ -10,19 +10,18 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Parses a command and dispatches it to the matching {@link Command}.
+ * The raw command dispatcher: parses a command and runs it, with no
+ * awareness of persistence, TTL scheduling, or anything else - just
+ * "input in, Command found and executed, result out."
  * <p>
  * This is the single chokepoint between "input in" and "command executed" -
- * both the REST controller (Phase 1) and the TCP/RESP server (Phase 4) call
- * into this class, so dispatch logic and command registration only exist
- * once. The REST path uses {@link #execute(String)} (whitespace-tokenized,
- * for convenience/backwards compatibility); the RESP path uses
- * {@link #execute(String[])} directly with tokens whose boundaries were
- * already determined by the wire protocol - which is what lets RESP-encoded
- * values contain spaces, unlike the whitespace-split path.
+ * REST, TCP, and AOF replay all funnel through here (REST/TCP via the
+ * {@link CommandDispatcher} interface, usually through the AOF-logging
+ * decorator; replay via this concrete class directly, bypassing that
+ * decorator so replayed commands aren't re-logged).
  */
 @Component
-public class CommandExecutor {
+public class CommandExecutor implements CommandDispatcher {
 
     private final Map<String, Command> commandsByName;
 
@@ -35,6 +34,7 @@ public class CommandExecutor {
      * Parses a raw whitespace-separated command line and dispatches it.
      * Values containing spaces are not supported here - see {@link #execute(String[])}.
      */
+    @Override
     public Object execute(String rawLine) {
         if (rawLine == null || rawLine.isBlank()) {
             throw new InvalidCommandException("empty command");
@@ -46,6 +46,7 @@ public class CommandExecutor {
      * Dispatches an already-tokenized command. Used by the RESP path, where
      * the protocol itself delimits argument boundaries explicitly.
      */
+    @Override
     public Object execute(String[] tokens) {
         if (tokens.length == 0) {
             throw new InvalidCommandException("empty command");
@@ -59,6 +60,16 @@ public class CommandExecutor {
 
         String[] args = Arrays.copyOfRange(tokens, 1, tokens.length);
         return command.execute(args);
+    }
+
+    /**
+     * @return true if {@code commandName} is a registered write command.
+     * Used by the AOF-logging decorator, after a successful execute(), to
+     * decide whether the command needs to be persisted.
+     */
+    public boolean isWriteCommand(String commandName) {
+        Command command = commandsByName.get(commandName.toUpperCase());
+        return command != null && command.isWrite();
     }
 
     private String[] tokenize(String rawLine) {

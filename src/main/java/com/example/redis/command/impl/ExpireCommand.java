@@ -36,4 +36,9 @@ public class ExpireCommand implements Command {
         boolean applied = store.expire(args[0], ttlSeconds);
         return applied ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

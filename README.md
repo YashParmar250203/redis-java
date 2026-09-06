@@ -215,4 +215,38 @@ back to client
 
 **What should be improved before Phase 5:** persistence (AOF) will need to hook into the same `CommandExecutor.execute` path to log every mutating command — worth checking whether that's best done as a decorator around `CommandExecutor` or inside each `Command`, before writing any persistence code.
 
+---
+
+## Phase 5 — Persistence and Crash Recovery
+
+**What was implemented:** AOF (append-only file) persistence with configurable fsync policy, plus an alternative RDB-style periodic snapshot strategy — switchable via `redis.persistence.mode=aof|snapshot|none` (default `aof`).
+
+**Architecture changes:**
+- Extracted a `CommandDispatcher` interface; `CommandExecutor` is now the "raw" implementation. REST (`CommandController`) and TCP (`TcpServer`/`ClientConnection`) depend on the interface, not the concrete class.
+- New `PersistingCommandDispatcher` (in a new `persistence` package) decorates `CommandExecutor`: runs the real command first, and only if it succeeds *and* the resolved `Command.isWrite()` is true, appends it to the AOF. `@Primary` + `@ConditionalOnProperty` mean it only exists (and only gets auto-wired in place of the raw executor) when `redis.persistence.mode=aof`.
+- Every `Command` implementation now declares `isWrite()` explicitly — no default — so a new command author must consciously decide, rather than silently inheriting a guess that could cause silent data loss (a missed write) or wasted logging (a logged read) on crash recovery.
+- AOF entries are RESP-encoded (`protocol.RespCommandEncoder`), the same format real Redis's own AOF has used since v7. Replay (`persistence.AofReader`) reuses `RequestParser` from Phase 4 directly.
+- `storage.Snapshottable` interface + `InMemoryStore` implementation for RDB-style dumps (Java serialization of a plain-`HashMap` copy of the keyspace); `persistence.SnapshotWriterScheduler` writes it to a temp file and atomically renames it into place on a fixed interval.
+- `persistence.PersistenceRecoveryRunner` (`@Order(1)`) restores state at startup according to the configured mode, always through the raw `CommandExecutor` (never the AOF-logging decorator, or replay would re-log everything forever). `TcpServer` is `@Order(2)` so no client can connect before recovery finishes.
+
+**Design decisions:**
+- **AOF logging lives in a decorator, not inside any `Command`.** This was flagged as an open question at the end of Phase 4 and resolved here: commands stay completely unaware persistence exists.
+- **AOF and snapshot are mutually exclusive strategies, not combined.** Real Redis's combined mode (RDB baseline + AOF rewrite/compaction layered on top) requires coordinating AOF-rewrite timing with snapshot timing — genuinely hard, and deliberately out of scope. Implementing both correctly in isolation was judged more valuable than one half-integrated hybrid.
+- **Reusing the Phase 4 parser for AOF replay wasn't just convenient — it solved a real problem for free.** The parser's rule of never consuming a record until it's confirmed complete (built for TCP packets arriving in pieces) means a truncated AOF tail from a mid-write crash is handled correctly with zero new code.
+- **Fsync policy is configurable and precisely documented** (`ALWAYS`/`EVERYSEC`/`NO`), matching real Redis's own three options and their exact durability trade-offs (see `AofFsyncPolicy` javadoc).
+- **Snapshots are written atomically** (temp file + atomic rename), matching real Redis's RDB save — a reader can never observe a half-written file.
+
+**Known, honestly-stated limitations:**
+- **TTL correctness bug on AOF replay:** `SET key value EX 60` is logged verbatim; replaying it recomputes the expiry as *replay-time + 60s*, silently resetting the TTL window instead of preserving the original expiry moment. Real Redis avoids this by rewriting relative expiries to absolute timestamps (`PEXPIREAT`) before logging. Fixing this properly would mean giving the persistence layer command-specific rewriting knowledge, which conflicts with keeping commands persistence-unaware — flagged rather than silently worked around.
+- Snapshotting copies the live map directly rather than using a true copy-on-write fork() (which real Redis's RDB save uses) — a fast, "mostly consistent" snapshot, not a strictly atomic one.
+- Java serialization is used for the snapshot format: simple and correct for this project, but not cross-language portable and fragile across incompatible code changes, unlike Redis's own compact, versioned binary RDB format.
+- A brief startup race exists between Spring's embedded Tomcat (which starts during context refresh, before `ApplicationRunner`s run) and `PersistenceRecoveryRunner` completing — a REST request could theoretically arrive before recovery finishes. Left as a Phase 10 hardening concern since REST is only used for ad hoc testing here.
+
+**Tests:** `AofWriterReaderTest` covers write→replay round trips (including values with spaces), a missing file, a genuinely truncated trailing record, and a genuinely malformed record — the last two specifically verifying the "stop, don't guess" corruption behavior. `InMemoryStoreSnapshotTest` covers a full round trip across every data type plus TTL, complete state replacement on restore, and an already-expired-but-unreaped key correctly staying expired after restore. `CommandExecutorTest` gained `isWriteCommand` coverage.
+
+**What I learned:** why persistence belongs in a decorator rather than in command logic; how storing AOF entries in the same wire format the parser already understands turns "handle corruption gracefully" from new work into free reuse; the precise (not hand-wavy) difference between what each fsync policy actually protects against; why AOF+RDB coordination is a genuinely hard problem rather than a missing afternoon of work.
+
+**What should be improved before Phase 6:** concurrency work is next - benchmarking the TCP server's single-threaded model against the REST path's multi-threaded one, and revisiting whether `AofWriter`'s `synchronized` methods become a bottleneck under concurrent write load.
+
+
 

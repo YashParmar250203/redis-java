@@ -32,4 +32,9 @@ public class GetCommand implements Command {
         }
         return store.get(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

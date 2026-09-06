@@ -33,4 +33,9 @@ public class ZRangeCommand implements Command {
         int stop = Arguments.parseInteger(args[2]);
         return sortedSetOperations.zrange(args[0], start, stop);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }

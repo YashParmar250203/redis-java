@@ -39,4 +39,9 @@ public class DelCommand implements Command {
         }
         return deletedCount;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

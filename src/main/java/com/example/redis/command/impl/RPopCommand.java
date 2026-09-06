@@ -27,4 +27,9 @@ public class RPopCommand implements Command {
         }
         return listOperations.rpop(args[0]);
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

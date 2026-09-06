@@ -27,4 +27,9 @@ public class ZRemCommand implements Command {
         }
         return sortedSetOperations.zrem(args[0], args[1]) ? 1 : 0;
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

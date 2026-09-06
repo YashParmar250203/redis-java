@@ -26,4 +26,15 @@ public interface Command {
      * @throws com.example.redis.exception.RedisException if arguments are invalid.
      */
     Object execute(String[] args);
+
+    /**
+     * @return true if this command mutates the keyspace (and therefore must
+     * be logged to the AOF once it succeeds), false if it's read-only.
+     * Deliberately no default implementation: every command must declare
+     * this explicitly rather than silently inheriting a guess - getting this
+     * wrong in either direction is a real correctness bug (a missed write
+     * silently loses data on crash recovery; a logged read wastes disk and,
+     * worse, could misrepresent what actually happened during replay).
+     */
+    boolean isWrite();
 }

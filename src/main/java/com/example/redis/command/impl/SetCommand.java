@@ -49,4 +49,9 @@ public class SetCommand implements Command {
         }
         throw new SyntaxErrorException();
     }
+
+    @Override
+    public boolean isWrite() {
+        return true;
+    }
 }

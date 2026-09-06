@@ -30,4 +30,9 @@ public class LRangeCommand implements Command {
         int stop = Arguments.parseInteger(args[2]);
         return listOperations.lrange(args[0], start, stop);
     }
+
+    @Override
+    public boolean isWrite() {
+        return false;
+    }
 }
