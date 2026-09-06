@@ -110,7 +110,7 @@ class CommandExecutorTest {
     @Test
     void emptyCommandThrowsInvalidCommandException() {
         assertThrows(InvalidCommandException.class, () -> executor.execute("   "));
-        // assertThrows(InvalidCommandException.class, () -> executor.execute(null));
+        assertThrows(InvalidCommandException.class, () -> executor.execute((String) null));
     }
 
     @Test
