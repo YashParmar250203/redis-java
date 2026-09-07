@@ -248,5 +248,26 @@ back to client
 
 **What should be improved before Phase 6:** concurrency work is next - benchmarking the TCP server's single-threaded model against the REST path's multi-threaded one, and revisiting whether `AofWriter`'s `synchronized` methods become a bottleneck under concurrent write load.
 
+---
+
+## Phase 6 — Concurrency and Memory Management
+
+**What was implemented:** Configurable eviction (`redis.maxmemory-policy=noeviction|allkeys-lru|allkeys-lfu`, default `noeviction` matching real Redis's own default) with a key-count limit (`redis.max-keys`, `0` = unlimited) as a documented proxy for real memory accounting. Full concurrency design writeup in `docs/concurrency.md`.
+
+**Architecture changes:** `InMemoryStore` gained two side-indexes (`lastAccessedAtNanos`, `accessFrequency`) using per-key `AtomicLong`/`LongAdder`, an `evictedKeyCount` counter (ready for Phase 10's metrics work), and a capacity check invoked before every operation that could insert a genuinely new key (`set`, `getOrCreate`).
+
+**Design decisions:**
+- **No global lock for LRU/LFU, on purpose.** The textbook LRU answer (doubly-linked list + hashmap under one lock) would contradict everything this project has done — every structure so far was chosen specifically to avoid exactly that kind of shared-lock bottleneck. Instead, recency/frequency are independent per-key atomics, and eviction samples a handful of random keys and picks the worst one (`EVICTION_SAMPLE_SIZE = 5`, matching real Redis's actual `maxmemory-samples` default) — the same sampling philosophy Phase 2's active expiration already established, reused rather than reinvented.
+- **This isn't a shortcut relative to real Redis — it's what real Redis does.** Redis doesn't maintain exact LRU order either, for the identical reason: exact ordering under concurrent access is expensive, and a good-enough approximation is nearly free.
+- **`noeviction` throws the exact error text real Redis returns** (`OOM command not allowed when used memory > 'maxmemory'`), rather than inventing project-specific error language.
+- **The capacity check is deliberately not fully atomic with the insert that follows it** — nesting an eviction's `data.remove()` inside another key's `data.compute()` callback would violate `ConcurrentHashMap`'s own guidance against mutating other mappings from within a compute callback. The accepted trade-off (a small race window under heavy concurrent inserts) is documented in `docs/concurrency.md` rather than hidden.
+
+**Tests:** `InMemoryStoreEvictionTest` covers `noeviction` rejecting new keys while still allowing overwrites of existing ones, LRU evicting the actual least-recently-used key (and correctly treating a never-accessed key as maximally evictable), LFU evicting the least-frequently-used key, the eviction counter, and tracker cleanup on delete. Tests deliberately keep `maxKeys` ≤ the sample size (5), which makes eviction sampling cover every key deterministically — turning what could have been a flaky, randomness-dependent test suite into a reliable one, without changing any production code to do it.
+
+**What I learned:** how to get LRU/LFU-style behavior without the contention a "correct-looking" linked-list design would introduce; that Redis's approximate eviction isn't a compromise for a toy project but the actual real-world answer; how to reason about (and document, rather than silently accept) the one remaining real contention point in a system built almost entirely lock-free.
+
+**What should be improved before Phase 7:** `MULTI`/`EXEC` transactions will need to interact carefully with the AOF decorator - a transaction's commands should probably be logged as a single atomic block (real Redis wraps them in `MULTI`/`EXEC` in the AOF too) rather than as independent entries, worth designing before writing transaction code.
+
+
 
 

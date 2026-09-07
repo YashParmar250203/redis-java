@@ -1,6 +1,9 @@
 package com.example.redis.storage;
 
+import com.example.redis.exception.MaxMemoryReachedException;
 import com.example.redis.exception.WrongTypeException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayInputStream;
@@ -19,6 +22,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 
 /**
@@ -43,6 +48,14 @@ import java.util.function.Supplier;
  *     <li><b>Empty containers are deleted.</b> Popping the last element of a
  *     list (or removing the last member of a set/hash/zset) removes the key
  *     entirely, matching real Redis.</li>
+ *     <li><b>Eviction without a global lock.</b> Rather than an exact LRU
+ *     structure (a doubly-linked list under one shared lock - the classic
+ *     but contention-heavy textbook answer), recency/frequency are tracked
+ *     as independent per-key atomics ({@link AtomicLong}/{@link LongAdder}),
+ *     and eviction samples a handful of random keys and picks the worst one
+ *     - the same approach used for active expiration in Phase 2, and the
+ *     same approach real Redis itself uses (its `maxmemory-samples` config
+ *     is exactly this). No key's access ever contends with another key's.</li>
  * </ul>
  */
 @Component
@@ -51,25 +64,57 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
     private static final int ACTIVE_EXPIRATION_SAMPLE_SIZE = 20;
     private static final int ACTIVE_EXPIRATION_MAX_ROUNDS = 5;
     private static final double ACTIVE_EXPIRATION_REPEAT_THRESHOLD = 0.25;
+    private static final int EVICTION_SAMPLE_SIZE = 5; // matches real Redis's default maxmemory-samples
 
     private final ConcurrentHashMap<String, StoredValue> data = new ConcurrentHashMap<>();
 
     /** Index of keys currently carrying a TTL - see Phase 2 notes on active expiration. */
     private final Set<String> keysWithExpiry = ConcurrentHashMap.newKeySet();
 
+    /** Per-key last-access timestamps, used only under ALLKEYS_LRU. */
+    private final Map<String, AtomicLong> lastAccessedAtNanos = new ConcurrentHashMap<>();
+
+    /** Per-key access counters, used only under ALLKEYS_LFU. */
+    private final Map<String, LongAdder> accessFrequency = new ConcurrentHashMap<>();
+
+    private final LongAdder evictedKeyCount = new LongAdder();
+
+    private final MaxMemoryPolicy maxMemoryPolicy;
+    private final int maxKeys;
+
+    /** Convenience constructor for direct/test use: no eviction, unlimited keys. */
+    public InMemoryStore() {
+        this(MaxMemoryPolicy.NOEVICTION.name(), 0);
+    }
+
+    @Autowired
+    public InMemoryStore(@Value("${redis.maxmemory-policy:noeviction}") String maxMemoryPolicy,
+                          @Value("${redis.max-keys:0}") int maxKeys) {
+        this.maxMemoryPolicy = MaxMemoryPolicy.fromConfig(maxMemoryPolicy);
+        this.maxKeys = maxKeys;
+    }
+
     // ================= STRING + TTL =================
 
     @Override
     public void set(String key, String value) {
+        if (!data.containsKey(key)) {
+            enforceCapacityBeforeInsertingNewKey(key);
+        }
         data.put(key, new StoredValue(value, null, RedisType.STRING));
         keysWithExpiry.remove(key);
+        recordAccess(key);
     }
 
     @Override
     public void set(String key, String value, long ttlSeconds) {
+        if (!data.containsKey(key)) {
+            enforceCapacityBeforeInsertingNewKey(key);
+        }
         long expireAt = System.currentTimeMillis() + ttlSeconds * 1000;
         data.put(key, new StoredValue(value, expireAt, RedisType.STRING));
         keysWithExpiry.add(key);
+        recordAccess(key);
     }
 
     @Override
@@ -86,6 +131,8 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
     public boolean delete(String key) {
         StoredValue removed = data.remove(key);
         keysWithExpiry.remove(key);
+        lastAccessedAtNanos.remove(key);
+        accessFrequency.remove(key);
         return removed != null && !isExpired(removed);
     }
 
@@ -105,6 +152,7 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
             return false;
         }
         keysWithExpiry.add(key);
+        recordAccess(key);
         return true;
     }
 
@@ -128,6 +176,11 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
     @Override
     public int size() {
         return data.size();
+    }
+
+    /** Exposed for future metrics work (Phase 10 explicitly wants an evicted_keys counter). */
+    public long evictedKeyCount() {
+        return evictedKeyCount.sum();
     }
 
     @Override
@@ -412,6 +465,10 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
      * command (LPUSH, SADD, HSET, ZADD).
      */
     private StoredValue getOrCreate(String key, RedisType expectedType, Supplier<Object> emptyValueSupplier) {
+        if (!data.containsKey(key)) {
+            enforceCapacityBeforeInsertingNewKey(key);
+        }
+        recordAccess(key);
         return data.compute(key, (k, existing) -> {
             if (existing == null || isExpired(existing)) {
                 keysWithExpiry.remove(key);
@@ -454,6 +511,7 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
             reap(key, current);
             return null;
         }
+        recordAccess(key);
         return current;
     }
 
@@ -471,9 +529,95 @@ public class InMemoryStore implements Store, ListOperations, SetOperations, Hash
     private void reap(String key, StoredValue expectedValue) {
         data.remove(key, expectedValue);
         keysWithExpiry.remove(key);
+        lastAccessedAtNanos.remove(key);
+        accessFrequency.remove(key);
     }
 
     private boolean isExpired(StoredValue value) {
         return value.expireAtMillis() != null && value.expireAtMillis() <= System.currentTimeMillis();
+    }
+
+    // ================= eviction (maxmemory-policy) =================
+
+    /**
+     * Called before inserting a genuinely new key. Does nothing if there's
+     * room, if maxKeys is unlimited (0), or if the key already exists
+     * (overwriting never increases key count). Otherwise either rejects the
+     * write (NOEVICTION - real Redis's own default) or makes room by
+     * evicting one sampled key.
+     * <p>
+     * Known race: this check-then-act isn't atomic with the insert that
+     * follows it, so under heavy concurrent inserts, size could transiently
+     * exceed maxKeys by a small margin, or an eviction could occur when
+     * (in hindsight) it wasn't strictly needed. Consistent with the
+     * approximate, best-effort philosophy already used for expiration and
+     * eviction sampling elsewhere in this project - not treated as a bug.
+     */
+    private void enforceCapacityBeforeInsertingNewKey(String newKey) {
+        if (maxKeys <= 0 || data.size() < maxKeys) {
+            return;
+        }
+        if (maxMemoryPolicy == MaxMemoryPolicy.NOEVICTION) {
+            throw new MaxMemoryReachedException();
+        }
+        evictOneKeySampled();
+    }
+
+    /**
+     * Samples a bounded number of random keys and evicts whichever scores
+     * worst under the configured policy - no global lock, no exact ordering,
+     * same trade-off Phase 2's active expiration makes and the same one
+     * real Redis's own `maxmemory-samples` setting makes.
+     */
+    private void evictOneKeySampled() {
+        List<String> allKeys = new ArrayList<>(data.keySet());
+        if (allKeys.isEmpty()) {
+            return;
+        }
+        Collections.shuffle(allKeys);
+
+        int sampleSize = Math.min(EVICTION_SAMPLE_SIZE, allKeys.size());
+        String victim = null;
+        long worstScore = Long.MAX_VALUE;
+
+        for (int i = 0; i < sampleSize; i++) {
+            String candidate = allKeys.get(i);
+            long score = scoreForEviction(candidate);
+            if (score < worstScore) {
+                worstScore = score;
+                victim = candidate;
+            }
+        }
+
+        if (victim != null) {
+            data.remove(victim);
+            keysWithExpiry.remove(victim);
+            lastAccessedAtNanos.remove(victim);
+            accessFrequency.remove(victim);
+            evictedKeyCount.increment();
+        }
+    }
+
+    /** Lower score = worse (more evictable). Untracked keys score as "never used" - a prime eviction candidate. */
+    private long scoreForEviction(String key) {
+        if (maxMemoryPolicy == MaxMemoryPolicy.ALLKEYS_LFU) {
+            LongAdder count = accessFrequency.get(key);
+            return count == null ? 0L : count.sum();
+        }
+        AtomicLong lastAccess = lastAccessedAtNanos.get(key);
+        return lastAccess == null ? Long.MIN_VALUE : lastAccess.get();
+    }
+
+    /**
+     * Updates whichever tracker the configured policy actually needs.
+     * Independent per-key atomics, not a shared ordered structure - so
+     * tracking one key's access never contends with another key's.
+     */
+    private void recordAccess(String key) {
+        if (maxMemoryPolicy == MaxMemoryPolicy.ALLKEYS_LRU) {
+            lastAccessedAtNanos.computeIfAbsent(key, k -> new AtomicLong()).set(System.nanoTime());
+        } else if (maxMemoryPolicy == MaxMemoryPolicy.ALLKEYS_LFU) {
+            accessFrequency.computeIfAbsent(key, k -> new LongAdder()).increment();
+        }
     }
 }
