@@ -1,273 +1,447 @@
-# redis-java — Phase 1: Core Key-Value Engine
+# redis-java — A Redis Clone Built From Scratch (Java + Spring Boot)
 
-A Redis-inspired in-memory database built from scratch in Java + Spring Boot.
-This README covers **Phase 1 only**, per the project's phase-by-phase build rule.
+A from-scratch reimplementation of core Redis internals: a typed in-memory
+data engine, TTL expiration, a hand-rolled TCP server speaking real RESP,
+AOF/snapshot persistence, and sampling-based LRU/LFU eviction — no Redis
+dependency anywhere, no third-party command-engine library. Spring Boot is
+used for wiring, configuration, and the REST test surface; every piece of
+actual database logic is original.
 
-## What was implemented
+**This README is written as interview prep, not just documentation.** It
+covers what was built, *why* each design decision was made over the
+alternatives, what's deliberately simplified (and why that's honest
+engineering, not a gap), and a dedicated Q&A section mapping common
+interview questions directly to parts of this codebase.
 
-- Thread-safe in-memory key-value store (`InMemoryStore`, backed by `ConcurrentHashMap`)
-- `SET key value`, `GET key`, `DEL key [key ...]`, `EXISTS key [key ...]`
-- A transport-agnostic `Command` abstraction + `CommandExecutor` dispatcher
-- A REST endpoint (`POST /api/command`) that accepts raw Redis-style command
-  text and returns a JSON envelope
-- Centralized, Redis-style error handling (`ERR ...` messages)
-- Unit tests for storage, dispatch, and the REST layer (incl. a concurrency test)
+---
 
-## Architecture
+## Table of Contents
 
-```
-controller/   → CommandController (HTTP -> CommandExecutor)
-command/      → Command interface, CommandExecutor (parsing + dispatch)
-command/impl/ → SetCommand, GetCommand, DelCommand, ExistsCommand
-storage/      → Store interface, InMemoryStore (ConcurrentHashMap-backed)
-model/        → CommandResponse (JSON envelope: success/result/error)
-exception/    → RedisException hierarchy (Redis-style "ERR ..." messages)
-config/       → GlobalExceptionHandler (RedisException -> HTTP 400 JSON)
-```
+1. [What This Demonstrates](#what-this-demonstrates)
+2. [Quick Start](#quick-start)
+3. [Architecture Overview](#architecture-overview)
+4. [Supported Commands](#supported-commands)
+5. [Deep Dive: Data Structures](#deep-dive-data-structures)
+6. [Deep Dive: TTL & Expiration](#deep-dive-ttl--expiration)
+7. [Deep Dive: Networking — TCP Server & RESP Protocol](#deep-dive-networking--tcp-server--resp-protocol)
+8. [Deep Dive: Persistence — AOF & Snapshots](#deep-dive-persistence--aof--snapshots)
+9. [Deep Dive: Eviction & Memory Management](#deep-dive-eviction--memory-management)
+10. [Deep Dive: Concurrency Design](#deep-dive-concurrency-design)
+11. [Key Design Decisions, Consolidated](#key-design-decisions-consolidated)
+12. [Known Limitations (Stated Honestly)](#known-limitations-stated-honestly)
+13. [Interview Q&A — Mapped to This Codebase](#interview-qa--mapped-to-this-codebase)
+14. [Testing Strategy](#testing-strategy)
+15. [Project Structure](#project-structure)
+16. [Configuration Reference](#configuration-reference)
+17. [Roadmap (Not Yet Built)](#roadmap-not-yet-built)
 
-Data flow:
+---
 
-```
-HTTP POST /api/command  ("SET name Yash")
-        |
-        v
-CommandController -----> CommandExecutor.execute(rawLine)
-                                |
-                        tokenize + look up Command by name
-                                |
-                                v
-                       SetCommand.execute(args) ---> Store.set(key, value)
-                                |
-                                v
-                        CommandResponse (JSON)
-```
+## What This Demonstrates
 
-## Why this design
+- **Data structures under real constraints**: choosing a concurrent structure per access pattern (deque, skip list, hash-backed set) instead of "one map, one lock."
+- **Network protocol implementation**: a hand-rolled RESP parser handling partial TCP reads correctly — the actual hard part of building any wire protocol.
+- **Systems trade-offs stated precisely**: fsync durability levels, AOF vs snapshot, exact vs approximate LRU — each with the *real* cost/benefit, not a hand-wave.
+- **Concurrency reasoning**: where locks exist, why they're scoped as narrowly as possible, and an honest admission of the one place they aren't (AOF writes).
+- **Decorator-based extensibility**: persistence and (in later phases) transactions bolt onto a dispatch layer that never had to change.
 
-**`ConcurrentHashMap` over `synchronized Map`.** ConcurrentHashMap uses
-bucket-level locking (and CAS operations for the common path) instead of one
-lock guarding the entire map. Reads are effectively lock-free; writes only
-contend when two threads hit the same bucket. This matters once concurrent
-clients are added in Phase 6 — a single global lock would serialize every
-operation regardless of which keys are touched.
+---
 
-**`Command` abstraction now, even though Phase 1 only needs 4 REST calls.**
-Phase 4 replaces the transport with a raw TCP server parsing RESP, and both
-transports need to reach the exact same dispatch/validation logic. By
-routing REST through `CommandExecutor` today, adding TCP later means writing
-a socket loop that calls `CommandExecutor.execute(line)` — zero changes to
-command logic, tests, or validation.
-
-**Errors mirror Redis's own reply text** (`ERR wrong number of arguments for
-'set' command`) rather than generic Java exception messages. This means the
-error *content* is already correct for Phase 4, when these get wrapped as
-RESP error replies (`-ERR ...\r\n`) instead of HTTP 400 JSON bodies.
-
-## Time/space complexity
-
-| Command | Time complexity | Notes |
-|---|---|---|
-| `SET` | O(1) average | Single `ConcurrentHashMap.put` |
-| `GET` | O(1) average | Single `ConcurrentHashMap.get` |
-| `DEL` | O(n) in keys given | O(1) per key removed |
-| `EXISTS` | O(n) in keys given | O(1) per key checked |
-
-Space: O(k) where k = number of distinct keys currently stored.
-
-## Known limitations (by design, deferred to later phases)
-
-- Only string values — no lists/sets/hashes/sorted sets yet (Phase 3).
-- No TTL/expiration yet (Phase 2).
-- Tokenization is naive whitespace-splitting — a value containing a space
-  (e.g. `SET name "Yash Sharma"`) is **not** supported yet. Real argument
-  boundary handling arrives with RESP parsing in Phase 4.
-- Read-modify-write sequences (like a future `INCR`) are not atomic just
-  because the store is thread-safe — `store.get()` then `store.set()` is two
-  separate operations. This will matter in Phase 6/7 and needs
-  `ConcurrentHashMap.compute()`-style atomic updates.
-- No persistence — restarting the app clears all data (Phase 5).
-
-## How to run
+## Quick Start
 
 ```bash
 mvn spring-boot:run
 ```
 
-Test with curl:
+This starts two servers:
+- REST on `:8080` — `POST /api/command` with a raw command line as the body (e.g. `SET name Yash`). Meant for quick testing, not a production API.
+- Raw TCP on `:6380` (configurable via `redis.tcp.port`) — speaks real RESP. `redis-cli -p 6380` works against it directly.
 
 ```bash
-curl -X POST http://localhost:8080/api/command -H "Content-Type: text/plain" -d "SET name Yash"
-curl -X POST http://localhost:8080/api/command -H "Content-Type: text/plain" -d "GET name"
-curl -X POST http://localhost:8080/api/command -H "Content-Type: text/plain" -d "EXISTS name missing"
-curl -X POST http://localhost:8080/api/command -H "Content-Type: text/plain" -d "DEL name"
+redis-cli -p 6380
+127.0.0.1:6380> SET name Yash
+OK
+127.0.0.1:6380> LPUSH mylist a b c
+(integer) 3
+127.0.0.1:6380> LRANGE mylist 0 -1
+1) "c"
+2) "b"
+3) "a"
 ```
 
-Run tests:
+No `redis-cli` on Windows? See `test-tcp.ps1` — a zero-dependency PowerShell client using raw `TcpClient` sockets.
 
-```bash
-mvn test
-```
-
-## What I learned (fill this in as you build)
-
-- Why `ConcurrentHashMap`'s locking strategy beats a single global lock
-  under concurrent access, and how to explain that in an interview.
-- Why decoupling command dispatch from transport (REST now, TCP later)
-  avoids rewriting business logic when the protocol changes.
-- The difference between a command "succeeding with a null result" (GET
-  miss) and a command "failing" (unknown command) — and why conflating
-  them in an API is a design smell.
-
-## Phase 2 — TTL and Expiration
-
-**What was implemented:** `SET key value EX seconds`, `EXPIRE key seconds`, `TTL key`. Hybrid lazy + active expiration.
-
-**Architecture changes:** `StoredValue` wraps every value with an optional `expireAtMillis`. A `keysWithExpiry` index (separate from the main map) lets active expiration sample only keys that actually have a TTL. A new `ttl` package holds `ExpirationScheduler`, a `@Scheduled(fixedDelay = 100)` job that mimics Redis's real active-expire-cycle: sample up to 20 keys with a TTL, reap expired ones, and repeat immediately if more than 25% of the sample was expired.
-
-**Design decisions:** `EXPIRE` uses `ConcurrentHashMap.computeIfPresent` for atomic read-modify-write, closing a race window a naive get-then-put would have. Errors mirror real Redis text (`ERR invalid expire time in 'expire' command`, etc).
-
-**Complexity:** `EXPIRE`/`TTL` are O(1) average. Active expiration is O(sample size) per cycle, not O(all keys).
-
-**Tests:** lazy expiration on read, TTL updates/clears, `DEL`/`EXPIRE` on already-expired keys, and a deterministic active-expiration-cycle test.
-
-**What I learned:** why lazy-only expiration leaks memory, why active-only wastes CPU scanning everything, and why the combination (plus sampling instead of full scans) is the standard answer.
-
-**What to improve before Phase 3:** none carried over — the TTL mechanism turned out to compose cleanly with typed values in Phase 3 below.
+Run tests: `mvn test`
 
 ---
 
-## Phase 3 — Redis Data Structures
+## Architecture Overview
 
-**What was implemented:** Lists (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`), Sets (`SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`), Hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`), Sorted Sets (`ZADD`, `ZRANGE`, `ZREM`).
+```
+com.example.redis/
+├── controller/    REST entry point (CommandController)
+├── server/        TCP server: NIO event loop + per-connection parsing (TcpServer, ClientConnection)
+├── protocol/      Wire format: RESP parsing + encoding (RequestParser, RespReplyEncoder, RespCommandEncoder)
+├── command/       Dispatch layer: Command interface, CommandExecutor, CommandDispatcher
+├── command/impl/  One class per command (22 commands)
+├── command/util/  Shared argument-parsing helpers
+├── storage/       The actual database engine (InMemoryStore + typed operation interfaces)
+├── persistence/   AOF + snapshot persistence, as a decorator around dispatch
+├── ttl/           Background active-expiration scheduler
+├── model/         Cross-layer reply types (SimpleStringReply, CommandResponse, etc.)
+├── exception/     RedisException hierarchy — every message matches real Redis's own text
+└── config/        Spring wiring (GlobalExceptionHandler)
+```
 
-**Architecture changes:** `StoredValue` now carries a `RedisType` tag (`STRING`/`LIST`/`SET`/`HASH`/`ZSET`); mismatched-type commands throw `WrongTypeException`. Storage operations are split into `ListOperations`, `SetOperations`, `HashOperations`, `SortedSetOperations` interfaces (mirroring Spring Data Redis's own split), all implemented by `InMemoryStore`, so each `Command` only depends on the interface it actually uses.
+### Request flow (both transports funnel through the same dispatcher)
 
-**Design decisions:**
-- Lists use `ConcurrentLinkedDeque` (lock-free, O(1) push/pop from either end) instead of hand-rolled locking.
-- Sets and hash field-maps reuse `ConcurrentHashMap`-backed structures.
-- Sorted sets use a dedicated `SortedSetValue`: a `ConcurrentHashMap<String,Double>` for O(1) score lookup plus a `ConcurrentSkipListSet<ScoredMember>` ordered by (score, member) for range queries — the same dual-structure design real Redis uses internally. Writes to a single ZSET's two structures are synchronized on that ZSET's own instance (lock scoped to one key, not the whole store).
-- Popping/removing the last element of a list/set/hash/zset deletes the key entirely, matching real Redis.
-- `getOrCreate` uses `ConcurrentHashMap.compute` so "check type, create if absent" is one atomic step.
+```
+REST: HTTP POST /api/command ("SET name Yash")
+TCP:  raw bytes over a socket, RESP or inline
+        │                              │
+        ▼                              ▼
+CommandController          ClientConnection (buffers bytes,
+        │                   calls RequestParser incrementally)
+        │                              │
+        └──────────┬───────────────────┘
+                    ▼
+         CommandDispatcher.execute(String[] tokens)
+                    │
+         (AOF-logging decorator, if enabled, wraps this)
+                    │
+                    ▼
+         CommandExecutor: look up Command by name, dispatch
+                    │
+                    ▼
+         Command.execute(args) → Store / ListOperations / etc.
+                    │
+                    ▼
+         Result: Java object (String, Long, List, Map, SimpleStringReply...)
+                    │
+         ┌──────────┴──────────┐
+         ▼                     ▼
+ CommandResponse (JSON)  RespReplyEncoder (RESP wire bytes)
+```
 
-**Complexity per operation:**
+**The single most important design decision in this project**: `CommandExecutor` (built in Phase 1, for 4 commands, over REST only) never had its dispatch logic changed to support a completely different transport (raw TCP/RESP, Phase 4) or a completely new cross-cutting concern (AOF persistence, Phase 5). Both were added by wrapping the *interface* it implements, `CommandDispatcher`, not by touching the dispatcher or any of the 22 command classes. That's the payoff of investing in a transport-agnostic abstraction one phase before it was strictly necessary.
 
-| Command | Complexity |
+---
+
+## Supported Commands
+
+| Type | Commands |
 |---|---|
-| `LPUSH`/`RPUSH`/`LPOP`/`RPOP` | O(1) |
-| `LRANGE` | O(n) snapshot + O(k) slice |
-| `SADD`/`SREM`/`SISMEMBER` | O(1) average |
-| `SMEMBERS` | O(n) |
-| `HSET`/`HGET`/`HDEL` | O(1) average |
-| `HGETALL` | O(n) in field count |
-| `ZADD`/`ZREM` | O(log n) |
-| `ZRANGE` | O(n) — see limitation below |
+| String + TTL | `SET` (+ `EX`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE` |
+| Set | `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HGETALL` |
+| Sorted Set | `ZADD`, `ZRANGE`, `ZREM` |
 
-**Known limitation (intentional, documented rather than hidden):** `ZRANGE` walks the ordered structure from the front, so it's O(n) to reach an arbitrary start index instead of O(log n). Real Redis's skip list carries "span" counters per level specifically to support O(log n) rank access. Building that augmented skip list is a natural, strong interview-story extension — deferred rather than over-engineered into this phase.
-
-**Tests:** per-type happy path, empty-key behavior (reads return empty, not errors), empty-container key deletion, and `WrongTypeException` cross-type checks; a `ZADD` score-update-reorders-rank test for the sorted set.
-
-**What I learned:** how to pick a concurrent structure per access pattern instead of reaching for "one lock over everything"; why Redis's own ZSET needs two coordinated structures and how to reason about the consistency window that coordination trades away; interface segregation applied to a real storage layer.
-
-**What should be improved before Phase 4:** the RESP tokenizer will need real argument-boundary parsing (values containing spaces aren't supported by today's whitespace-split parser) — this becomes unavoidable once binary-safe values are on the table.
+22 commands total, each its own class implementing `Command`, each explicitly declaring whether it's a write (`isWrite()`) for AOF-logging purposes.
 
 ---
 
-## Phase 4 — Custom TCP Server and RESP Protocol
+## Deep Dive: Data Structures
 
-**What was implemented:** A single-threaded, NIO Selector-based TCP server on port 6380 (configurable via `redis.tcp.port`) speaking real RESP (multibulk arrays) and Redis's inline-command shorthand, both handled by the same incremental parser. `redis-cli -p 6380` works against it directly.
+Every Redis type maps to a specific concurrent Java structure, chosen for how it's actually accessed — not "whichever collection is closest to the textbook description."
 
-**Architecture changes:** New `server` package (`TcpServer`, `ClientConnection`) and `protocol` package (`RequestParser`, `RespReplyEncoder`). `CommandExecutor` gained `execute(String[] tokens)` — the REST path's `execute(String)` now just tokenizes and delegates to it. No `Command` implementation changed at all; the abstraction built in Phase 1 specifically for this moment did its job.
+### Strings — `ConcurrentHashMap<String, StoredValue>`
 
-```
-Client (redis-cli or telnet)
-        |  TCP
-        v
-TcpServer (NIO Selector event loop)
-        |
-ClientConnection (buffers bytes, calls RequestParser)
-        |
-RequestParser (RESP array or inline line -> String[] tokens)
-        |
-CommandExecutor.execute(String[])   <-- same dispatcher REST uses
-        |
-Command.execute(args) -> Store
-        |
-RespReplyEncoder (result -> RESP wire reply)
-        |
-        v
-back to client
+The core keyspace. `StoredValue` is an immutable record: `(Object value, Long expireAtMillis, RedisType type)`. Why `ConcurrentHashMap` over `synchronized Map`: it uses bucket-level locking / CAS internally, so reads are effectively lock-free and writes only contend when two threads hit the *same bucket* — not a single lock guarding the whole map. `SET`/`GET` are O(1) average.
+
+### Lists — `ConcurrentLinkedDeque<String>`
+
+A genuinely lock-free deque. `LPUSH`/`RPUSH`/`LPOP`/`RPOP` are O(1) with **zero explicit locking** — the structure's own CAS-based implementation handles concurrent pushes/pops from either end safely. `LRANGE` is O(n) to snapshot the deque (no random access) plus O(k) to slice — real Redis's own list range is comparably O(S+N).
+
+### Sets — `ConcurrentHashMap.newKeySet()`
+
+A thread-safe `Set<String>` for free, same underlying guarantees as the main keyspace map. O(1) average for `SADD`/`SREM`/`SISMEMBER`.
+
+### Hashes — `ConcurrentHashMap<String, String>`
+
+Same reasoning as the top-level store, one level down (field → value instead of key → value).
+
+### Sorted Sets — the interesting one
+
+Needs **two things at once**: O(1)-ish score lookup by member, and ordered iteration by score for range queries. Real Redis solves this internally with a hash table (member→score) *plus* a skip list (ordered by score) — and this project mirrors that exactly:
+
+```java
+class SortedSetValue {
+    private final Map<String, Double> scoresByMember = new ConcurrentHashMap<>();
+    private final ConcurrentSkipListSet<ScoredMember> orderedByScore = new ConcurrentSkipListSet<>();
+    // ScoredMember orders by (score, then member) — same tie-break real Redis uses
+}
 ```
 
-**Design decisions:**
-- **Single-threaded event loop, deliberately** — mirrors real Redis's own concurrency model. No locking needed around command execution on this path since only one command runs at a time across all clients; the honest cost is that one slow command blocks everyone else, same trade-off Redis itself makes.
-- **Dual protocol support is one implementation, not two** — real Redis servers accept both RESP arrays and plain inline lines; detecting by first byte (`*` vs anything else) is exactly what real Redis does, not a shortcut invented here.
-- **Never consume buffered bytes until a complete command is confirmed present.** This is the core correctness property for any incremental network parser — a command can arrive split across multiple reads, and partially consuming the buffer would corrupt framing for everything after it.
-- **`SimpleStringReply` marker type** was introduced so `SET`'s `"OK"` reply is distinguishable from a `GET` result that happens to literally be the string `"OK"` — only the former should be RESP-encoded as a status line (`+OK\r\n`) rather than a bulk string.
-- **Pipelining works without extra code** — parsing loops while the buffer still has a complete command, so multiple commands sent in one packet all get executed and replied to.
+Because these two structures must move together on every update, writes to *one ZSET's own instance* are `synchronized` — but that lock is scoped to that single sorted set, never global. `ZADD`/`ZREM` are O(log n).
 
-**Known, stated simplifications (not oversights):**
-- Connection data is treated as UTF-8 text, not raw binary — real Redis bulk strings are fully binary-safe (arbitrary bytes, including nulls); ours assumes single-byte-per-character content.
-- Writes use a simple blocking-retry loop rather than registering for `OP_WRITE` and resuming on write-readiness. Fine for this project's small, single-reply payloads; a server handling large replies or slow clients would need real write backpressure handling to avoid busy-spinning.
+**Stated limitation, not hidden**: `ZRANGE` walks the skip list from the front to reach an arbitrary start index — **O(n)**, not O(log n). Real Redis's skip list carries "span" counters per level specifically to support O(log n) rank access (jump straight to the k-th element). Building that augmented skip list would be the natural next step — a strong follow-up to bring up unprompted in an interview rather than something to be caught out on.
 
-**Tests:** `RequestParserTest` covers RESP parsing across multiple simulated TCP chunks (the actual hard part of this phase), pipelined inline commands, and malformed-input protocol errors — all without touching a real socket. `RespReplyEncoderTest` covers every reply type including the `"OK"`-as-bulk-string-vs-status-line distinction. `TcpServerIntegrationTest` opens genuine sockets against the real running server (bound to an OS-assigned ephemeral port via `redis.tcp.port=0`) and verifies inline commands, RESP round-trips, pipelining, error replies, and RESP values containing spaces.
+### Type safety across the whole keyspace
 
-**What I learned:** why an incremental parser must never partially consume its buffer; how to reason about partial TCP reads and reassembly; why Redis's single-threaded design is a legitimate engineering trade-off rather than a limitation to work around; how to keep a dispatch layer transport-agnostic in practice, not just in theory.
+Every `StoredValue` carries a `RedisType` tag. Calling a list command against a key holding a string throws `WrongTypeException` — matching real Redis's `WRONGTYPE` error exactly. Storage operations are split into four interfaces (`ListOperations`, `SetOperations`, `HashOperations`, `SortedSetOperations`) — the same split Spring Data Redis itself uses — so each `Command` class only depends on the interface it actually needs.
 
-**What should be improved before Phase 5:** persistence (AOF) will need to hook into the same `CommandExecutor.execute` path to log every mutating command — worth checking whether that's best done as a decorator around `CommandExecutor` or inside each `Command`, before writing any persistence code.
+**Empty containers delete their key.** Popping the last element of a list (or removing the last member of a set/hash/zset) removes the key entirely, matching real Redis — an empty list is not the same thing as no list.
 
 ---
 
-## Phase 5 — Persistence and Crash Recovery
+## Deep Dive: TTL & Expiration
 
-**What was implemented:** AOF (append-only file) persistence with configurable fsync policy, plus an alternative RDB-style periodic snapshot strategy — switchable via `redis.persistence.mode=aof|snapshot|none` (default `aof`).
+Two independent mechanisms, combined — the standard, correct answer to "how would you expire cache entries efficiently":
 
-**Architecture changes:**
-- Extracted a `CommandDispatcher` interface; `CommandExecutor` is now the "raw" implementation. REST (`CommandController`) and TCP (`TcpServer`/`ClientConnection`) depend on the interface, not the concrete class.
-- New `PersistingCommandDispatcher` (in a new `persistence` package) decorates `CommandExecutor`: runs the real command first, and only if it succeeds *and* the resolved `Command.isWrite()` is true, appends it to the AOF. `@Primary` + `@ConditionalOnProperty` mean it only exists (and only gets auto-wired in place of the raw executor) when `redis.persistence.mode=aof`.
-- Every `Command` implementation now declares `isWrite()` explicitly — no default — so a new command author must consciously decide, rather than silently inheriting a guess that could cause silent data loss (a missed write) or wasted logging (a logged read) on crash recovery.
-- AOF entries are RESP-encoded (`protocol.RespCommandEncoder`), the same format real Redis's own AOF has used since v7. Replay (`persistence.AofReader`) reuses `RequestParser` from Phase 4 directly.
-- `storage.Snapshottable` interface + `InMemoryStore` implementation for RDB-style dumps (Java serialization of a plain-`HashMap` copy of the keyspace); `persistence.SnapshotWriterScheduler` writes it to a temp file and atomically renames it into place on a fixed interval.
-- `persistence.PersistenceRecoveryRunner` (`@Order(1)`) restores state at startup according to the configured mode, always through the raw `CommandExecutor` (never the AOF-logging decorator, or replay would re-log everything forever). `TcpServer` is `@Order(2)` so no client can connect before recovery finishes.
+**Lazy expiration**: every read path (`get`, `exists`, `ttl`, `delete`, and all typed reads) checks `expireAtMillis <= now` and reaps the key on the way out if stale. Guarantees a client is never handed stale data — but alone, it **leaks memory** for keys that expire and are never read again.
 
-**Design decisions:**
-- **AOF logging lives in a decorator, not inside any `Command`.** This was flagged as an open question at the end of Phase 4 and resolved here: commands stay completely unaware persistence exists.
-- **AOF and snapshot are mutually exclusive strategies, not combined.** Real Redis's combined mode (RDB baseline + AOF rewrite/compaction layered on top) requires coordinating AOF-rewrite timing with snapshot timing — genuinely hard, and deliberately out of scope. Implementing both correctly in isolation was judged more valuable than one half-integrated hybrid.
-- **Reusing the Phase 4 parser for AOF replay wasn't just convenient — it solved a real problem for free.** The parser's rule of never consuming a record until it's confirmed complete (built for TCP packets arriving in pieces) means a truncated AOF tail from a mid-write crash is handled correctly with zero new code.
-- **Fsync policy is configurable and precisely documented** (`ALWAYS`/`EVERYSEC`/`NO`), matching real Redis's own three options and their exact durability trade-offs (see `AofFsyncPolicy` javadoc).
-- **Snapshots are written atomically** (temp file + atomic rename), matching real Redis's RDB save — a reader can never observe a half-written file.
+**Active expiration**: a background job (`ttl.ExpirationScheduler`, `@Scheduled(fixedDelay = 100)` — matching real Redis's actual 10×/sec default) reclaims those orphaned keys. It does **not** scan the whole keyspace. It samples up to 20 keys *only from a side-index of keys that currently have a TTL* (`keysWithExpiry`), reaps expired ones, and — matching real Redis's own algorithm precisely — **repeats immediately if more than 25% of the sample was expired** (up to 5 rounds), on the theory that expired keys cluster in time.
 
-**Known, honestly-stated limitations:**
-- **TTL correctness bug on AOF replay:** `SET key value EX 60` is logged verbatim; replaying it recomputes the expiry as *replay-time + 60s*, silently resetting the TTL window instead of preserving the original expiry moment. Real Redis avoids this by rewriting relative expiries to absolute timestamps (`PEXPIREAT`) before logging. Fixing this properly would mean giving the persistence layer command-specific rewriting knowledge, which conflicts with keeping commands persistence-unaware — flagged rather than silently worked around.
-- Snapshotting copies the live map directly rather than using a true copy-on-write fork() (which real Redis's RDB save uses) — a fast, "mostly consistent" snapshot, not a strictly atomic one.
-- Java serialization is used for the snapshot format: simple and correct for this project, but not cross-language portable and fragile across incompatible code changes, unlike Redis's own compact, versioned binary RDB format.
-- A brief startup race exists between Spring's embedded Tomcat (which starts during context refresh, before `ApplicationRunner`s run) and `PersistenceRecoveryRunner` completing — a REST request could theoretically arrive before recovery finishes. Left as a Phase 10 hardening concern since REST is only used for ad hoc testing here.
+```java
+for (round in 0..5) {
+    sample = random 20 keys from keysWithExpiry
+    expiredCount = reap expired ones in sample
+    if (expiredCount < sample.size() * 0.25) break
+}
+```
 
-**Tests:** `AofWriterReaderTest` covers write→replay round trips (including values with spaces), a missing file, a genuinely truncated trailing record, and a genuinely malformed record — the last two specifically verifying the "stop, don't guess" corruption behavior. `InMemoryStoreSnapshotTest` covers a full round trip across every data type plus TTL, complete state replacement on restore, and an already-expired-but-unreaped key correctly staying expired after restore. `CommandExecutorTest` gained `isWriteCommand` coverage.
-
-**What I learned:** why persistence belongs in a decorator rather than in command logic; how storing AOF entries in the same wire format the parser already understands turns "handle corruption gracefully" from new work into free reuse; the precise (not hand-wavy) difference between what each fsync policy actually protects against; why AOF+RDB coordination is a genuinely hard problem rather than a missing afternoon of work.
-
-**What should be improved before Phase 6:** concurrency work is next - benchmarking the TCP server's single-threaded model against the REST path's multi-threaded one, and revisiting whether `AofWriter`'s `synchronized` methods become a bottleneck under concurrent write load.
+`EXPIRE` uses `ConcurrentHashMap.computeIfPresent` for atomic read-modify-write — closing the race window a naive `get()`-then-`put()` would leave open, and correctly returning "no-op" if the key was concurrently found to be already expired.
 
 ---
 
-## Phase 6 — Concurrency and Memory Management
+## Deep Dive: Networking — TCP Server & RESP Protocol
 
-**What was implemented:** Configurable eviction (`redis.maxmemory-policy=noeviction|allkeys-lru|allkeys-lfu`, default `noeviction` matching real Redis's own default) with a key-count limit (`redis.max-keys`, `0` = unlimited) as a documented proxy for real memory accounting. Full concurrency design writeup in `docs/concurrency.md`.
+### Single-threaded NIO event loop, deliberately
 
-**Architecture changes:** `InMemoryStore` gained two side-indexes (`lastAccessedAtNanos`, `accessFrequency`) using per-key `AtomicLong`/`LongAdder`, an `evictedKeyCount` counter (ready for Phase 10's metrics work), and a capacity check invoked before every operation that could insert a genuinely new key (`set`, `getOrCreate`).
+`TcpServer` uses a `Selector`-based non-blocking event loop: **one thread** handles accept/read/parse/execute/write for every connected client. This mirrors real Redis's own concurrency model on purpose: no locking is needed around command execution on this path, because a command runs to completion before the loop looks at the next ready channel — two clients' commands can *never* interleave mid-execution. The honest cost (also true of real Redis): one slow command blocks every other client until it finishes.
 
-**Design decisions:**
-- **No global lock for LRU/LFU, on purpose.** The textbook LRU answer (doubly-linked list + hashmap under one lock) would contradict everything this project has done — every structure so far was chosen specifically to avoid exactly that kind of shared-lock bottleneck. Instead, recency/frequency are independent per-key atomics, and eviction samples a handful of random keys and picks the worst one (`EVICTION_SAMPLE_SIZE = 5`, matching real Redis's actual `maxmemory-samples` default) — the same sampling philosophy Phase 2's active expiration already established, reused rather than reinvented.
-- **This isn't a shortcut relative to real Redis — it's what real Redis does.** Redis doesn't maintain exact LRU order either, for the identical reason: exact ordering under concurrent access is expensive, and a good-enough approximation is nearly free.
-- **`noeviction` throws the exact error text real Redis returns** (`OOM command not allowed when used memory > 'maxmemory'`), rather than inventing project-specific error language.
-- **The capacity check is deliberately not fully atomic with the insert that follows it** — nesting an eviction's `data.remove()` inside another key's `data.compute()` callback would violate `ConcurrentHashMap`'s own guidance against mutating other mappings from within a compute callback. The accepted trade-off (a small race window under heavy concurrent inserts) is documented in `docs/concurrency.md` rather than hidden.
+### Dual protocol support — one implementation, not two
 
-**Tests:** `InMemoryStoreEvictionTest` covers `noeviction` rejecting new keys while still allowing overwrites of existing ones, LRU evicting the actual least-recently-used key (and correctly treating a never-accessed key as maximally evictable), LFU evicting the least-frequently-used key, the eviction counter, and tracker cleanup on delete. Tests deliberately keep `maxKeys` ≤ the sample size (5), which makes eviction sampling cover every key deterministically — turning what could have been a flaky, randomness-dependent test suite into a reliable one, without changing any production code to do it.
+Real Redis servers accept both a RESP multibulk array *and* a plain newline-terminated "inline command" (a real, documented feature — not a simplification invented here). Detection is by first byte: `*` means RESP, anything else means inline. Both paths funnel into the exact same tokens.
 
-**What I learned:** how to get LRU/LFU-style behavior without the contention a "correct-looking" linked-list design would introduce; that Redis's approximate eviction isn't a compromise for a toy project but the actual real-world answer; how to reason about (and document, rather than silently accept) the one remaining real contention point in a system built almost entirely lock-free.
+### The actual hard part: partial reads
 
-**What should be improved before Phase 7:** `MULTI`/`EXEC` transactions will need to interact carefully with the AOF decorator - a transaction's commands should probably be logged as a single atomic block (real Redis wraps them in `MULTI`/`EXEC` in the AOF too) rather than as independent entries, worth designing before writing transaction code.
+TCP doesn't preserve message boundaries. A command can arrive split across multiple `read()` calls, or several commands can arrive in one `read()`. The **one correctness rule** the whole parser exists to enforce:
 
+> Never consume bytes from the buffer unless a complete command is confirmed present.
 
+```java
+// RequestParser.parseResp — simplified
+if (not enough bytes for the full multibulk array yet) {
+    return Optional.empty();   // buffer is untouched — safe to retry after more bytes arrive
+}
+buffer.delete(0, consumedLength);   // only now, once we're certain, do we advance
+return Optional.of(tokens);
+```
 
+Get this wrong and a partial read corrupts framing for every command after it. A nice side effect of doing this correctly: because the connection handler keeps calling the parser while the buffer still holds a complete command, **pipelining works for free** — multiple commands sent in one packet all get executed and replied to, with zero extra code.
 
+### Reply encoding — RESP is not "just add quotes"
+
+`RespReplyEncoder` distinguishes reply *types* precisely: `+OK\r\n` (simple status) vs `$2\r\nOK\r\n` (bulk string) look almost identical but mean different things on the wire — a `GET` whose value happens to literally be `"OK"` must never be encoded as a status line. This is why `SetCommand` returns a dedicated `SimpleStringReply("OK")` marker instead of a raw string — the encoder branches on type, not on value.
+
+### Stated simplifications
+
+- Connection data is treated as UTF-8 text, not raw binary. Real Redis bulk strings are fully binary-safe (arbitrary bytes, including nulls); this implementation assumes single-byte-per-character content.
+- Writes use a simple blocking-retry loop instead of registering for `OP_WRITE` and resuming on write-readiness. Fine for small, single-reply payloads; a server handling large replies or slow clients would need real backpressure handling to avoid busy-spinning.
+
+---
+
+## Deep Dive: Persistence — AOF & Snapshots
+
+Two independent, switchable strategies (`redis.persistence.mode = aof | snapshot | none`), implemented correctly in isolation rather than one half-integrated hybrid.
+
+### AOF (append-only file)
+
+Every successful **write** command is appended to a log, RESP-encoded — the same wire format real Redis's own AOF has used since v7. This isn't incidental: it means replay reuses the *exact same* `RequestParser` from the TCP server. That parser's core correctness rule (never consume an incomplete record) was built to survive a command split across TCP packets — and it turns out to solve **"gracefully handle a truncated AOF from a mid-write crash" for free**, with zero new code. A genuinely malformed record mid-file (not just a truncated tail) stops replay entirely, matching real Redis's own default behavior of refusing to guess past corruption.
+
+**Where AOF logging lives**: not inside any `Command` — that would violate separation of concerns. Instead, `PersistingCommandDispatcher` *decorates* `CommandExecutor` behind the shared `CommandDispatcher` interface: run the real command first, and only if it **succeeds** *and* `Command.isWrite()` is true, append it. `Command` implementations have zero awareness this exists.
+
+**Fsync policy** (`redis.aof.fsync = always | everysec | no`), matching real Redis's own three options with the *exact* trade-off each represents:
+
+| Policy | Guarantee | Cost |
+|---|---|---|
+| `ALWAYS` | Survives a full power loss — bytes are physically on disk before the write returns | A disk sync on every single write |
+| `EVERYSEC` (default) | Bounds data loss to ~1 second, regardless of write volume | Negligible — one background flush/sec |
+| `NO` | Survives *our process* crashing (bytes are already handed to the kernel) | Does **not** survive an OS crash or power loss before the kernel flushes dirty pages |
+
+That `NO` distinction — survives process crash, not OS crash — is the kind of precise detail that separates a real answer from a hand-wavy one.
+
+### Snapshots (RDB-style)
+
+A periodic full dump of the keyspace, written to a **temp file then atomically renamed** into place — the same trick real Redis's RDB save uses, so a crash mid-write can never corrupt the previous good snapshot; a reader only ever sees the old complete file or the new complete file.
+
+**Stated trade-off vs AOF**: a snapshot's data-loss window is "however long since the last snapshot" (minutes) vs AOF's "at most the fsync interval" (~1 second). In exchange, snapshotting has effectively zero per-command overhead.
+
+**Why AOF and snapshot aren't combined**: real Redis's combined mode (RDB baseline + AOF rewrite/compaction layered on top) requires coordinating AOF-rewrite timing with snapshot timing — genuinely hard. Treating them as mutually exclusive, switchable strategies was judged more valuable than a half-correct integration.
+
+### A bug worth naming, not hiding
+
+`SET key value EX 60` is logged **verbatim**. Replaying it at restart recomputes the expiry as *replay-time + 60s* — silently **resetting the TTL window** instead of preserving the original expiry moment. Real Redis avoids this by rewriting relative expiries to absolute timestamps (`PEXPIREAT`) before logging. Fixing it here would mean giving the persistence decorator command-specific rewriting knowledge, conflicting with keeping commands persistence-unaware — so it's documented as a known limitation rather than silently patched around. **This is a genuinely good thing to bring up unprompted in an interview** — it shows you found a real correctness issue by reasoning about replay semantics, not just by testing the happy path.
+
+---
+
+## Deep Dive: Eviction & Memory Management
+
+### No global lock for LRU/LFU — on purpose
+
+The textbook LRU answer is a doubly-linked list + hashmap under one shared lock — and every read *and* write would need to mutate that shared structure. That directly contradicts every other design decision in this project (every structure so far was chosen specifically to avoid a shared-lock bottleneck).
+
+Instead: recency (`AtomicLong` per key) and frequency (`LongAdder` per key) are tracked as **independent per-key atomics** — touching one key's counter never contends with any other key's. Eviction samples a handful of random keys (`EVICTION_SAMPLE_SIZE = 5`, matching real Redis's actual `maxmemory-samples` default) and evicts whichever scores worst in the sample.
+
+**This is not a shortcut relative to real Redis — it's what real Redis actually does.** Redis doesn't maintain true LRU order either, for the identical reason: exact ordering under concurrent access is expensive, and random-sample approximation is nearly free and good enough in practice.
+
+```java
+// simplified
+sample = 5 random keys from the whole keyspace
+victim = the one with the lowest recorded access time (LRU) or count (LFU)
+evict(victim)
+```
+
+A key that's never been touched scores as "oldest possible" (`Long.MIN_VALUE`) — a sensible default, and the one code path that's genuinely hard to exercise through normal commands (since `SET` itself records an access — writing is a form of using a key). It's actually reachable through **snapshot restore**, which rebuilds the keyspace directly without touching the access trackers — a freshly-restored key legitimately has zero LRU history.
+
+### `noeviction` is the default — matching real Redis
+
+A lot of people assume Redis evicts by default. It doesn't. When the limit is hit under `noeviction`, a write that would add a new key fails with the exact real Redis error text: `OOM command not allowed when used memory > 'maxmemory'`.
+
+### Stated limitation: key-count, not real memory
+
+`redis.max-keys` is a **proxy** for actual memory usage — real Redis enforces true byte-level accounting via its allocator. The JVM doesn't expose anything that cheap or precise, so key-count stands in, explicitly labeled as such rather than disguised as real memory tracking.
+
+---
+
+## Deep Dive: Concurrency Design
+
+(Full detail in `docs/concurrency.md`.)
+
+| Structure | Used for | Why not a lock |
+|---|---|---|
+| `ConcurrentHashMap` | keyspace, hash fields, sets, TTL/access indexes | Bucket-level locking/CAS — writes only contend on the same bucket |
+| `ConcurrentLinkedDeque` | Lists | Genuinely lock-free CAS-based linked list |
+| `ConcurrentSkipListSet` | Sorted set ordering | Lock-free skip list, safe concurrent iteration |
+| `AtomicLong` / `LongAdder` | LRU timestamps, LFU counts, eviction count | Per-key atomics — no cross-key contention |
+
+**Where locks genuinely exist, and why they're narrow:**
+- `SortedSetValue` (`synchronized`): its hash-table and ordered structure must move together — the lock is scoped to *that one ZSET's own instance*, never global.
+- `AofWriter` (`synchronized`): file-channel operations aren't documented as safe for unsynchronized concurrent callers.
+
+**The one real, named contention point**: every other structure in this project is scoped per-key. `AofWriter` is the exception — when AOF is enabled, *every* write command, regardless of which key it touched, serializes through one shared file-append call. This is a genuine bottleneck under high concurrent write load, and it's not a design flaw to apologize for — real Redis's own AOF has the identical property, for the identical reason (one shared log file). Naming your own system's real bottleneck, unprompted, is a stronger interview moment than waiting to be asked "where's the contention?"
+
+**One deliberately-accepted race**: eviction's capacity check (`enforceCapacityBeforeInsertingNewKey`) is check-then-act, *not* atomic with the insert that follows it — done to avoid nesting an eviction's `data.remove()` inside another key's `data.compute()` callback, which `ConcurrentHashMap`'s own documentation warns against. Under heavy concurrent inserts, key count could transiently drift slightly past `maxKeys`. Consistent with the approximate philosophy used throughout, and documented rather than hidden.
+
+---
+
+## Key Design Decisions, Consolidated
+
+| Decision | What was chosen | Why over the obvious alternative |
+|---|---|---|
+| Storage locking | `ConcurrentHashMap` + per-type concurrent structures | A single global lock would serialize every operation regardless of which key was touched |
+| Command dispatch | Transport-agnostic `Command`/`CommandExecutor`, built before it was "needed" | Let TCP (Phase 4) and AOF (Phase 5) bolt on without touching 22 command classes |
+| Expiration | Lazy + active (sampled), not one or the other | Lazy alone leaks memory; active-only (full scan) wastes CPU |
+| ZSET internals | Dual hash-table + skip list, per-key lock | Mirrors real Redis; avoids a global ZSET lock |
+| TCP concurrency | Single-threaded event loop | Matches real Redis's own model — no locking needed on the hot path |
+| AOF format | RESP, not custom text | Free reuse of the exact same parser for replay + corruption handling |
+| Persistence hook point | Decorator around dispatch, not inside commands | Keeps `Command` classes fully unaware persistence exists |
+| Eviction | Random sampling + independent atomics, not a shared LRU list | Avoids a global lock; matches real Redis's actual approach, not a compromise |
+| AOF vs snapshot | Mutually exclusive strategies | Combining them correctly (AOF rewrite) is genuinely hard; two correct isolated implementations beat one half-integrated hybrid |
+
+---
+
+## Known Limitations (Stated Honestly)
+
+Being able to list these unprompted, with the *correct* fix named, is worth more in an interview than pretending they don't exist:
+
+1. **`ZRANGE` is O(n)**, not O(log n) — needs a rank-augmented ("span-counter") skip list to fix.
+2. **AOF replay resets relative TTLs** — needs absolute-timestamp rewriting (`PEXPIREAT`-equivalent) before logging.
+3. **Not binary-safe** — connection data is UTF-8 text; real Redis bulk strings can hold arbitrary bytes.
+4. **`MSET`-equivalent multi-key writes aren't atomic across keys** (n/a until Phase 7, but the reasoning already applies to any future multi-key command) — true atomicity would need a lock broader than anything else in the codebase.
+5. **Snapshot isn't a true point-in-time view** — it copies the live map directly rather than using copy-on-write `fork()` like real Redis's RDB save.
+6. **Java serialization for snapshots** — simple and correct here, but not cross-language portable or resilient to code changes, unlike Redis's own versioned binary RDB format.
+7. **`max-keys` is a key-count proxy**, not real memory accounting.
+8. **A brief startup race** exists between Spring's embedded Tomcat (starts during context refresh) and persistence recovery completing — a REST request could theoretically arrive before recovery finishes.
+9. **AOF writes serialize globally** through one file lock — the one real contention point in an otherwise per-key-scoped system.
+
+---
+
+## Interview Q&A — Mapped to This Codebase
+
+**"How would you design a cache with expiration?"**
+→ Lazy expiration (check on read) alone leaks memory for untouched expired keys. Active-only (background full scan) wastes CPU. I implemented both: lazy for correctness, plus a sampled background sweep (20 random keys from an index of *only* keys with a TTL, repeating if >25% were expired) — see `InMemoryStore.runActiveExpirationCycle`.
+
+**"Design an LRU cache."**
+→ The textbook answer is a doubly-linked list + hashmap under one lock. I deliberately didn't build that, because it reintroduces the exact shared-lock bottleneck every other structure in this project avoids. Instead: independent per-key atomic timestamps, and eviction samples a handful of random keys and picks the worst — the same technique real Redis's `maxmemory-samples` uses. Trade exact ordering for near-zero contention.
+
+**"How do you handle a TCP message that arrives split across multiple reads?"**
+→ Never consume bytes from the buffer until a complete message is confirmed present. See `RequestParser` — this single rule is what makes RESP parsing (and, for free, AOF corruption recovery) correct.
+
+**"What's the difference between AOF and RDB persistence, and their trade-offs?"**
+→ AOF logs every write; bounded data loss (~1s on `everysec`), higher steady-state overhead. Snapshot/RDB dumps the whole keyspace periodically; near-zero overhead between snapshots, but a bigger data-loss window. Combining them well (AOF rewrite on top of an RDB baseline) is genuinely hard — I implemented both correctly as switchable strategies rather than one half-integrated hybrid.
+
+**"How would you implement a sorted set / leaderboard?"**
+→ You need both O(1)-ish score lookup by member *and* ordered range queries. One structure can't efficiently give you both — real Redis (and this project) uses two coordinated structures: a hash table for lookup, a skip list for order.
+
+**"Where are the locks in your system, and why there?"**
+→ Two places, both narrow: a ZSET's own dual-structure update (locked per-ZSET-instance, not globally), and AOF file appends (globally serialized, because there's one shared log file — the one real bottleneck in the system, and I can name exactly why).
+
+**"How do you avoid a race condition in a check-then-act operation, like 'set a TTL only if the key exists'?"**
+→ `ConcurrentHashMap.computeIfPresent` — the check and the mutation happen as one atomic step per key, rather than a `get()` then a separate `put()` with a window in between.
+
+**"What would you benchmark first in this system?"**
+→ Not an abstract "TCP vs REST" number — specifically, AOF-enabled vs AOF-disabled write throughput under concurrent load, since that's the one place a shared lock is known to exist (see `docs/concurrency.md`).
+
+---
+
+## Testing Strategy
+
+- **Storage layer**: exhaustive per-type unit tests (happy path, empty-key behavior, `WRONGTYPE` cross-type checks, empty-container deletion), plus dedicated concurrency tests (concurrent writes to distinct keys, concurrent writes to the same key).
+- **Protocol layer**: `RequestParserTest` simulates a request arriving across multiple chunks, pipelined commands in one buffer, and malformed input — all without a real socket. `RespReplyEncoderTest` covers every reply type, including the "OK"-as-bulk-string-vs-status-line distinction.
+- **Networking**: `TcpServerIntegrationTest` opens genuine sockets against the actual running server (bound to an OS-assigned ephemeral port), verifying inline commands, RESP round-trips, pipelining, and error replies end-to-end.
+- **Persistence**: write→replay round trips including values with spaces, a missing file, a genuinely truncated record, and a genuinely malformed record — verifying "stop, don't guess" behavior precisely.
+- **Eviction**: tests deliberately keep `maxKeys` ≤ the sample size (5), which makes sampling examine *every* key deterministically — turning what could have been a flaky, randomness-dependent suite into a reliable one, without changing any production code to achieve it.
+
+---
+
+## Project Structure
+
+```
+redis-java/
+├── src/main/java/com/example/redis/
+│   ├── RedisApplication.java
+│   ├── controller/CommandController.java
+│   ├── server/            TcpServer, ClientConnection
+│   ├── protocol/          RequestParser, RespReplyEncoder, RespCommandEncoder
+│   ├── command/           Command, CommandDispatcher, CommandExecutor
+│   ├── command/impl/      22 command classes
+│   ├── command/util/      Arguments (shared parsing helpers)
+│   ├── storage/           InMemoryStore + typed operation interfaces + Snapshottable
+│   ├── persistence/       AofWriter, AofReader, PersistingCommandDispatcher, SnapshotWriterScheduler, PersistenceRecoveryRunner
+│   ├── ttl/                ExpirationScheduler
+│   ├── model/              SimpleStringReply, CommandResponse
+│   ├── exception/           RedisException hierarchy
+│   └── config/              GlobalExceptionHandler
+├── src/test/java/...        mirrors main, ~106+ tests
+├── docs/concurrency.md       full concurrency design writeup
+└── test-tcp.ps1               zero-dependency Windows PowerShell TCP test client
+```
+
+---
+
+## Configuration Reference
+
+```properties
+# Networking
+redis.tcp.port=6380
+
+# Persistence: aof | snapshot | none
+redis.persistence.mode=aof
+redis.aof.path=data/appendonly.aof
+redis.aof.fsync=everysec            # always | everysec | no
+redis.snapshot.path=data/dump.snapshot
+redis.snapshot.interval-ms=300000
+
+# Eviction
+redis.maxmemory-policy=noeviction   # noeviction | allkeys-lru | allkeys-lfu
+redis.max-keys=0                    # 0 = unlimited
+```
+
+---
+
+## Roadmap (Not Yet Built)
+
+Phases 7–10 per the original project plan: `MULTI`/`EXEC`/`DISCARD`/`WATCH` transactions and `INCR`/`DECR`/`MSET`/`MGET` (Phase 7), performance benchmarking with real numbers (Phase 8), distributed sharding/replication (Phase 9), and production polish — metrics, structured logging, Docker (Phase 10). `evictedKeyCount()` and `isWrite()` were already added ahead of time specifically so Phase 10's metrics work and Phase 7's transaction/AOF interaction have less to retrofit.
